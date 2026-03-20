@@ -638,6 +638,42 @@ link_playit() {
     "$PLAYIT_DIR/playit" || true
 }
 
+auto_setup_playit() {
+    clear
+    line
+    echo "Auto playit setup"
+    line
+
+    if [ ! -x "$PLAYIT_DIR/playit" ]; then
+        echo "Installing playit..."
+        install_playit || true
+    fi
+
+    if [ ! -x "$PLAYIT_DIR/playit" ]; then
+        cecho "31" "playit could not be installed."
+        return 1
+    fi
+
+    if [ ! -f "$PLAYIT_CONFIG_FILE" ]; then
+        echo ""
+        echo "playit is not linked yet."
+        echo "Starting the one-time linking flow now."
+        echo "Complete the linking in the playit screen, then press Ctrl+C to return here."
+        echo ""
+        printf 'Press ENTER to continue...'
+        read -r _
+        link_playit || true
+    fi
+
+    if [ ! -f "$PLAYIT_CONFIG_FILE" ]; then
+        cecho "31" "playit still is not linked. Auto setup cannot continue."
+        return 1
+    fi
+
+    start_playit_background || return 1
+    cecho "32" "Auto playit setup finished."
+}
+
 start_playit_background() {
     if [ ! -x "$PLAYIT_DIR/playit" ]; then
         cecho "31" "Install playit first."
@@ -695,22 +731,43 @@ playit_menu() {
         playit_status
         printf '\n'
         line
-        echo "1. Install or update playit"
-        echo "2. Link playit account"
-        echo "3. Start playit tunnel"
-        echo "4. Show playit status"
-        echo "5. Stop playit tunnel"
-        echo "6. Back"
-        printf '\nSelect [1-6]: '
+        echo "1. Auto playit setup"
+        echo "2. Manual playit setup"
+        echo "3. Show playit status"
+        echo "4. Stop playit tunnel"
+        echo "5. Back"
+        printf '\nSelect [1-5]: '
         read -r choice
 
         case "$choice" in
-            1) install_playit; pause ;;
+            1) auto_setup_playit || true; pause ;;
+            2) manual_playit_menu ;;
+            3) playit_status || true; pause ;;
+            4) stop_playit || true; pause ;;
+            5) return 0 ;;
+        esac
+    done
+}
+
+manual_playit_menu() {
+    while true; do
+        playit_status
+        printf '\n'
+        line
+        echo "Manual playit setup"
+        line
+        echo "1. Install or update playit"
+        echo "2. Link playit account"
+        echo "3. Start playit tunnel"
+        echo "4. Back"
+        printf '\nSelect [1-4]: '
+        read -r choice
+
+        case "$choice" in
+            1) install_playit || true; pause ;;
             2) link_playit ;;
-            3) start_playit_background; pause ;;
-            4) playit_status; pause ;;
-            5) stop_playit; pause ;;
-            6) return 0 ;;
+            3) start_playit_background || true; pause ;;
+            4) return 0 ;;
         esac
     done
 }
@@ -780,11 +837,11 @@ main_menu() {
         read -r choice
 
         case "$choice" in
-            1) install_server; pause ;;
-            2) install_addons; pause ;;
+            1) install_server || true; pause ;;
+            2) install_addons || true; pause ;;
             3) start_server ;;
-            4) change_ram; pause ;;
-            5) open_server_folder ;;
+            4) change_ram || true; pause ;;
+            5) open_server_folder || true ;;
             6) playit_menu ;;
             7) ;;
             8) exit 0 ;;
