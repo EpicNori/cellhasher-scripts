@@ -893,7 +893,7 @@ auto_setup_playit() {
     echo "Auto playit setup"
     line
     echo "This mode tries the same automatic guest-claim flow used by auto-mcs."
-    echo "If that fails, it falls back to saved-key mode, then manual linking."
+    echo "If that fails, it returns to the Playit menu without manual fallback."
 
     if [ ! -x "$PLAYIT_DIR/playit" ]; then
         echo "Installing playit..."
@@ -908,7 +908,11 @@ auto_setup_playit() {
     if ! playit_has_secret && [ ! -f "$PLAYIT_CONFIG_FILE" ]; then
         echo ""
         echo "Trying full automatic Playit claim..."
-        playit_create_guest_secret || true
+        if ! playit_create_guest_secret; then
+            cecho "31" "Automatic Playit setup failed."
+            cecho "33" "Returning to the Playit menu."
+            return 1
+        fi
     fi
 
     if playit_has_secret; then
@@ -917,25 +921,8 @@ auto_setup_playit() {
         cecho "32" "Auto playit setup finished using automatic API mode."
         return 0
     fi
-
-    if [ ! -f "$PLAYIT_CONFIG_FILE" ]; then
-        echo ""
-        echo "playit is not linked yet."
-        echo "Starting the one-time linking flow now."
-        echo "Complete the linking in the playit screen, then press Ctrl+C to return here."
-        echo ""
-        printf 'Press ENTER to continue...'
-        read -r _
-        link_playit || true
-    fi
-
-    if [ ! -f "$PLAYIT_CONFIG_FILE" ]; then
-        cecho "31" "playit still is not linked. Auto setup cannot continue."
-        return 1
-    fi
-
-    start_playit_background || return 1
-    cecho "32" "Auto playit setup finished."
+    cecho "31" "Automatic Playit setup could not complete."
+    return 1
 }
 
 auto_playit_site_only() {
