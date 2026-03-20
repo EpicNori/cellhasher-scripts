@@ -75,9 +75,10 @@ STATE_DIR="$BASE_DIR/state"
 STATE_FILE="$STATE_DIR/server.env"
 START_SCRIPT="$BASE_DIR/start-server.sh"
 PLAYIT_DIR="$BASE_DIR/playit"
-PLAYIT_CONFIG_DIR="$HOME/.config/playit_gg"
-PLAYIT_CONFIG_FILE="$PLAYIT_CONFIG_DIR/playit.toml"
+PLAYIT_CONFIG_DIR="$PLAYIT_DIR"
+PLAYIT_CONFIG_FILE="$PLAYIT_DIR/playit.toml"
 PLAYIT_SECRET_FILE="$PLAYIT_DIR/secret_key.txt"
+PLAYIT_VERSION_FILE="$PLAYIT_DIR/version.txt"
 PLAYIT_PID_FILE="$PLAYIT_DIR/playit.pid"
 PLAYIT_LOG_FILE="$PLAYIT_DIR/playit.log"
 PLAYIT_AGENT_BOOT_LOG="$PLAYIT_DIR/playit-boot.log"
@@ -544,105 +545,152 @@ install_addons() {
 }
 
 install_playit() {
-    local arch asset_url
-    local releases_json
+    local arch asset_name asset_url release_json release_tag
 
     mkdir -p "$PLAYIT_DIR"
     arch=$(uname -m)
-    releases_json=$(curl -fsSL "https://api.github.com/repos/playit-cloud/playit-agent/releases/latest")
+    release_json=$(curl -fsSL -A "$USER_AGENT" "https://api.github.com/repos/playit-cloud/playit-agent/releases/latest")
+    release_tag=$(printf '%s' "$release_json" | jq -r '.tag_name // empty' | sed 's/^v//')
 
     case "$arch" in
-        aarch64|arm64)
-            asset_url=$(printf '%s' "$releases_json" | jq -r '.assets[] | select(.name == "playit-linux-aarch64") | .browser_download_url' | head -n1)
-            ;;
-        armv7l|armv8l)
-            asset_url=$(printf '%s' "$releases_json" | jq -r '.assets[] | select(.name == "playit-linux-armv7") | .browser_download_url' | head -n1)
-            ;;
+        aarch64|arm64) asset_name="playit-linux-aarch64" ;;
+        armv7l|armv8l) asset_name="playit-linux-armv7" ;;
+        x86_64) asset_name="playit-linux-amd64" ;;
         *)
-            cecho "31" "Unsupported CPU architecture for automatic playit install: $arch"
+            cecho "31" "Unsupported CPU architecture: $arch"
             return 1
             ;;
     esac
 
+    asset_url=$(printf '%s' "$release_json" | jq -r --arg name "$asset_name" '.assets[] | select(.name == $name) | .browser_download_url' | head -n1)
     if [ -z "$asset_url" ]; then
-        cecho "31" "Could not find a playit binary for $arch"
+        cecho "31" "Could not find a Playit release asset for $asset_name"
         return 1
     fi
 
     curl -fL -o "$PLAYIT_DIR/playit" "$asset_url"
     chmod +x "$PLAYIT_DIR/playit"
 
-    cecho "32" "playit installed to $PLAYIT_DIR"
-    cecho "33" "Use the Playit menu to link and start the tunnel."
+    if [ -n "$release_tag" ]; then
+        printf '%s' "$release_tag" > "$PLAYIT_VERSION_FILE"
+    fi
+
+    cecho "32" "Playit installed."
 }
 
-playit_secret_from_config() {
-    if [ -f "$PLAYIT_CONFIG_FILE" ]; then
-        awk -F= '/secret_key/ {gsub(/["[:space:]]/, "", $2); print $2; exit}' "$PLAYIT_CONFIG_FILE"
+playit_get_secret_key() {
+    if [ ! -f "$PLAYIT_CONFIG_FILE" ]; then
+        return 1
     fi
+    awk -F= '/secret_key/ {gsub(/["[:space:]]/, "", $2); print $2; exit}' "$PLAYIT_CONFIG_FILE"
 }
 
 playit_write_secret_config() {
     local secret_key="$1"
-    mkdir -p "$PLAYIT_CONFIG_DIR"
+    mkdir -p "$PLAYIT_DIR"
     cat > "$PLAYIT_CONFIG_FILE" <<EOF
 secret_key = "$secret_key"
 EOF
     chmod 600 "$PLAYIT_CONFIG_FILE" 2>/dev/null || true
+    printf '%s' "$secret_key" > "$PLAYIT_SECRET_FILE"
+    chmod 600 "$PLAYIT_SECRET_FILE" 2>/dev/null || true
 }
 
-playit_claim_code_from_log() {
-    if [ ! -f "$PLAYIT_AGENT_BOOT_LOG" ]; then
-        return 1
+playit_get_agent_version() {
+    local version_text
+
+    version_text=$(cat "$PLAYIT_VERSION_FILE" 2>/dev/null || true)
+    if [ -n "$version_text" ]; then
+        printf '%s' "$version_text"
+        return 0
     fi
-    grep -o 'https://playit.gg/claim/[A-Za-z0-9]\{10\}' "$PLAYIT_AGENT_BOOT_LOG" 2>/dev/null | tail -n1 | awk -F/ '{print $NF}' | tr '[:upper:]' '[:lower:]'
+
+    if [ -x "$PLAYIT_DIR/playit" ]; then
+        version_text=$("$PLAYIT_DIR/playit" --version 2>/dev/null | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
+        if [ -n "$version_text" ]; then
+            printf '%s' "$version_text" > "$PLAYIT_VERSION_FILE"
+            printf '%s' "$version_text"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+playit_has_secret() {
+    [ -n "$(playit_get_secret_key 2>/dev/null || true)" ]
 }
 
 playit_api_post() {
     local endpoint="$1"
     local auth_header="$2"
     local payload="$3"
+    local response_file
+
+    response_file=$(mktemp)
 
     if [ -n "$auth_header" ]; then
-        curl -fsSL -A "$USER_AGENT" -H "Authorization: $auth_header" -H "Content-Type: application/json" -d "$payload" "$PLAYIT_API_BASE/$endpoint"
+        if ! curl -sS -A "$USER_AGENT" -H "Authorization: $auth_header" -H "Content-Type: application/json" -d "$payload" "$PLAYIT_API_BASE/$endpoint" > "$response_file"; then
+            rm -f "$response_file"
+            return 1
+        fi
     else
-        curl -fsSL -A "$USER_AGENT" -H "Content-Type: application/json" -d "$payload" "$PLAYIT_API_BASE/$endpoint"
+        if ! curl -sS -A "$USER_AGENT" -H "Content-Type: application/json" -d "$payload" "$PLAYIT_API_BASE/$endpoint" > "$response_file"; then
+            rm -f "$response_file"
+            return 1
+        fi
+    fi
+
+    cat "$response_file"
+    rm -f "$response_file"
+}
+
+playit_connectivity_check() {
+    if ! curl -sS -I --connect-timeout 10 https://api.playit.gg >/dev/null 2>&1; then
+        cecho "31" "Cannot reach api.playit.gg from Termux right now."
+        return 1
     fi
 }
 
-playit_get_secret_key() {
-    local secret_key
-
-    secret_key=$(cat "$PLAYIT_SECRET_FILE" 2>/dev/null || true)
-    if [ -n "$secret_key" ]; then
-        printf '%s' "$secret_key"
-        return 0
-    fi
-
-    secret_key=$(playit_secret_from_config || true)
-    if [ -n "$secret_key" ]; then
-        printf '%s' "$secret_key" > "$PLAYIT_SECRET_FILE"
-        chmod 600 "$PLAYIT_SECRET_FILE" 2>/dev/null || true
-        printf '%s' "$secret_key"
-        return 0
-    fi
-
-    return 1
+playit_claim_code_from_log() {
+    grep -ao 'https://playit.gg/claim/[A-Za-z0-9]\{10\}' "$PLAYIT_AGENT_BOOT_LOG" 2>/dev/null | tail -n1 | awk -F/ '{print $NF}' | tr '[:upper:]' '[:lower:]'
 }
 
-playit_create_guest_secret() {
-    local claim_code guest_json session_key details_json setup_json accept_json exchange_json secret_key
-    local boot_pid boot_log_wait
-
-    mkdir -p "$PLAYIT_DIR" "$PLAYIT_CONFIG_DIR"
+playit_start_boot_agent() {
     rm -f "$PLAYIT_AGENT_BOOT_LOG"
-
     cd "$PLAYIT_DIR"
     "$PLAYIT_DIR/playit" -s --secret_path "$PLAYIT_CONFIG_FILE" > "$PLAYIT_AGENT_BOOT_LOG" 2>&1 &
-    boot_pid=$!
+    echo $!
+}
 
+playit_stop_boot_agent() {
+    local pid="$1"
+    if [ -n "$pid" ]; then
+        kill "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+    fi
+}
+
+playit_auto_claim_secret() {
+    local boot_pid claim_code guest_json session_key agent_version details_json setup_json accept_json exchange_json secret_key attempt
+
+    playit_connectivity_check || return 1
+
+    if [ ! -x "$PLAYIT_DIR/playit" ]; then
+        cecho "31" "Playit is not installed."
+        return 1
+    fi
+
+    agent_version=$(playit_get_agent_version || true)
+    if [ -z "$agent_version" ]; then
+        cecho "31" "Could not determine the Playit agent version."
+        return 1
+    fi
+
+    boot_pid=$(playit_start_boot_agent)
     claim_code=""
-    for boot_log_wait in $(seq 1 60); do
+
+    for attempt in $(seq 1 60); do
         claim_code=$(playit_claim_code_from_log || true)
         if [ -n "$claim_code" ]; then
             break
@@ -651,9 +699,8 @@ playit_create_guest_secret() {
     done
 
     if [ -z "$claim_code" ]; then
-        kill "$boot_pid" 2>/dev/null || true
-        wait "$boot_pid" 2>/dev/null || true
-        cecho "31" "Could not get a Playit claim code from the agent."
+        playit_stop_boot_agent "$boot_pid"
+        cecho "31" "Could not read a Playit claim code from the agent."
         [ -f "$PLAYIT_AGENT_BOOT_LOG" ] && tail -n 20 "$PLAYIT_AGENT_BOOT_LOG"
         return 1
     fi
@@ -661,21 +708,19 @@ playit_create_guest_secret() {
     guest_json=$(playit_api_post "login/create/guest" "" "{}" || true)
     session_key=$(printf '%s' "$guest_json" | jq -r '.data.session_key // empty' 2>/dev/null)
     if [ -z "$session_key" ]; then
-        kill "$boot_pid" 2>/dev/null || true
-        wait "$boot_pid" 2>/dev/null || true
+        playit_stop_boot_agent "$boot_pid"
         cecho "31" "Playit guest-session creation failed."
         printf '%s\n' "$guest_json"
         return 1
     fi
 
-    for boot_log_wait in $(seq 1 60); do
-        details_json=$(playit_api_post "claim/details" "bearer $session_key" "{\"code\":\"$claim_code\",\"agent_type\":\"self-managed\",\"version\":\"0.16.2\"}" || true)
+    for attempt in $(seq 1 60); do
+        details_json=$(playit_api_post "claim/details" "bearer $session_key" "{\"code\":\"$claim_code\",\"agent_type\":\"self-managed\",\"version\":\"$agent_version\"}" || true)
         if [ "$(printf '%s' "$details_json" | jq -r '.status // empty' 2>/dev/null)" = "success" ]; then
             break
         fi
         if [ "$(printf '%s' "$details_json" | jq -r '.data // empty' 2>/dev/null)" != "WaitingForAgent" ]; then
-            kill "$boot_pid" 2>/dev/null || true
-            wait "$boot_pid" 2>/dev/null || true
+            playit_stop_boot_agent "$boot_pid"
             cecho "31" "Playit claim/details failed."
             printf '%s\n' "$details_json"
             return 1
@@ -683,10 +728,9 @@ playit_create_guest_secret() {
         sleep 1
     done
 
-    setup_json=$(playit_api_post "claim/setup" "bearer $session_key" "{\"code\":\"$claim_code\",\"agent_type\":\"self-managed\",\"version\":\"0.16.2\"}" || true)
+    setup_json=$(playit_api_post "claim/setup" "bearer $session_key" "{\"code\":\"$claim_code\",\"agent_type\":\"self-managed\",\"version\":\"$agent_version\"}" || true)
     if [ "$(printf '%s' "$setup_json" | jq -r '.status // empty' 2>/dev/null)" != "success" ]; then
-        kill "$boot_pid" 2>/dev/null || true
-        wait "$boot_pid" 2>/dev/null || true
+        playit_stop_boot_agent "$boot_pid"
         cecho "31" "Playit claim/setup failed."
         printf '%s\n' "$setup_json"
         return 1
@@ -694,23 +738,21 @@ playit_create_guest_secret() {
 
     accept_json=$(playit_api_post "claim/accept" "bearer $session_key" "{\"code\":\"$claim_code\",\"name\":\"cellhasher-${claim_code:0:4}\",\"agent_type\":\"self-managed\"}" || true)
     if [ "$(printf '%s' "$accept_json" | jq -r '.status // empty' 2>/dev/null)" != "success" ]; then
-        kill "$boot_pid" 2>/dev/null || true
-        wait "$boot_pid" 2>/dev/null || true
+        playit_stop_boot_agent "$boot_pid"
         cecho "31" "Playit claim/accept failed."
         printf '%s\n' "$accept_json"
         return 1
     fi
 
     secret_key=""
-    for boot_log_wait in $(seq 1 30); do
+    for attempt in $(seq 1 30); do
         exchange_json=$(playit_api_post "claim/exchange" "bearer $session_key" "{\"code\":\"$claim_code\"}" || true)
         secret_key=$(printf '%s' "$exchange_json" | jq -r '.data.secret_key // empty' 2>/dev/null)
         if [ -n "$secret_key" ]; then
             break
         fi
         if [ "$(printf '%s' "$exchange_json" | jq -r '.data // empty' 2>/dev/null)" != "NotAccepted" ]; then
-            kill "$boot_pid" 2>/dev/null || true
-            wait "$boot_pid" 2>/dev/null || true
+            playit_stop_boot_agent "$boot_pid"
             cecho "31" "Playit claim/exchange failed."
             printf '%s\n' "$exchange_json"
             return 1
@@ -718,37 +760,43 @@ playit_create_guest_secret() {
         sleep 1
     done
 
-    kill "$boot_pid" 2>/dev/null || true
-    wait "$boot_pid" 2>/dev/null || true
+    playit_stop_boot_agent "$boot_pid"
 
     if [ -z "$secret_key" ]; then
-        cecho "31" "Playit secret-key exchange did not return a secret key."
+        cecho "31" "Playit claim/exchange returned no secret key."
         return 1
     fi
 
-    printf '%s' "$secret_key" > "$PLAYIT_SECRET_FILE"
-    chmod 600 "$PLAYIT_SECRET_FILE" 2>/dev/null || true
     playit_write_secret_config "$secret_key"
-    cecho "32" "Playit agent claimed automatically and secret key stored."
-    return 0
+    cecho "32" "Playit claimed successfully."
+}
+
+playit_get_agent_id() {
+    local secret_key agent_json
+
+    secret_key=$(playit_get_secret_key || true)
+    if [ -z "$secret_key" ]; then
+        return 1
+    fi
+
+    agent_json=$(playit_api_post "agents/rundata" "agent-key $secret_key" "{}" || true)
+    printf '%s' "$agent_json" | jq -r '.data.agent_id // empty' 2>/dev/null
 }
 
 playit_ensure_tunnel() {
     local port="${1:-25565}"
     local protocol="${2:-tcp}"
-    local secret_key agent_json agent_id tunnels_json existing_id tunnel_count create_payload create_json new_id
+    local secret_key agent_id tunnels_json existing_id tunnel_budget create_payload create_json
 
     secret_key=$(playit_get_secret_key || true)
     if [ -z "$secret_key" ]; then
-        cecho "31" "No Playit secret key available."
+        cecho "31" "No Playit secret key is configured."
         return 1
     fi
 
-    agent_json=$(playit_api_post "agents/rundata" "agent-key $secret_key" "{}" || true)
-    agent_id=$(printf '%s' "$agent_json" | jq -r '.data.agent_id // empty' 2>/dev/null)
+    agent_id=$(playit_get_agent_id || true)
     if [ -z "$agent_id" ]; then
-        cecho "31" "Could not get Playit agent ID."
-        printf '%s\n' "$agent_json"
+        cecho "31" "Could not retrieve the Playit agent ID."
         return 1
     fi
 
@@ -759,10 +807,10 @@ playit_ensure_tunnel() {
         return 0
     fi
 
-    tunnel_count=$(printf '%s' "$tunnels_json" | jq -r '[.data.tunnels[]? | .port_count] | add // 0' 2>/dev/null)
-    if [ -n "$tunnel_count" ] && [ "$tunnel_count" -ge 4 ]; then
-        cecho "33" "Playit account tunnel limit reached."
-        return 0
+    tunnel_budget=$(printf '%s' "$tunnels_json" | jq -r '[.data.tunnels[]? | .port_count] | add // 0' 2>/dev/null)
+    if [ -n "$tunnel_budget" ] && [ "$tunnel_budget" -ge 4 ]; then
+        cecho "33" "Playit tunnel limit reached."
+        return 1
     fi
 
     create_payload=$(cat <<EOF
@@ -771,34 +819,40 @@ EOF
 )
 
     create_json=$(playit_api_post "tunnels/create" "agent-key $secret_key" "$create_payload" || true)
-    new_id=$(printf '%s' "$create_json" | jq -r '.data.id // empty' 2>/dev/null)
-    if [ -n "$new_id" ]; then
+    if [ "$(printf '%s' "$create_json" | jq -r '.status // empty' 2>/dev/null)" = "success" ]; then
         cecho "32" "Playit tunnel created for port $port."
         return 0
     fi
 
-    cecho "31" "Failed to create Playit tunnel."
+    cecho "31" "Failed to create the Playit tunnel."
     printf '%s\n' "$create_json"
     return 1
 }
 
 playit_is_running() {
+    local pid
+
     if [ ! -f "$PLAYIT_PID_FILE" ]; then
         return 1
     fi
-    local pid
+
     pid=$(cat "$PLAYIT_PID_FILE" 2>/dev/null || true)
     if [ -z "$pid" ]; then
+        rm -f "$PLAYIT_PID_FILE"
         return 1
     fi
+
     if kill -0 "$pid" 2>/dev/null; then
         return 0
     fi
+
     rm -f "$PLAYIT_PID_FILE"
     return 1
 }
 
 playit_status() {
+    local secret_key agent_version agent_id
+
     clear
     line
     echo "Playit status"
@@ -810,14 +864,26 @@ playit_status() {
         echo "Binary : not installed"
     fi
 
-    if [ -f "$PLAYIT_CONFIG_FILE" ]; then
-        echo "Config : linked"
+    if playit_has_secret; then
+        echo "Config : ready"
     else
-        echo "Config : not linked yet"
+        echo "Config : not ready"
     fi
 
-    if [ -f "$PLAYIT_SECRET_FILE" ]; then
+    agent_version=$(playit_get_agent_version || true)
+    if [ -n "$agent_version" ]; then
+        echo "Version: $agent_version"
+    else
+        echo "Version: unknown"
+    fi
+
+    secret_key=$(playit_get_secret_key || true)
+    if [ -n "$secret_key" ]; then
         echo "Secret : saved"
+        agent_id=$(playit_get_agent_id || true)
+        if [ -n "$agent_id" ]; then
+            echo "Agent  : $agent_id"
+        fi
     else
         echo "Secret : not saved"
     fi
@@ -851,7 +917,7 @@ link_playit() {
     read -r _
 
     cd "$PLAYIT_DIR"
-    "$PLAYIT_DIR/playit" || true
+    "$PLAYIT_DIR/playit" -s --secret_path "$PLAYIT_CONFIG_FILE" || true
 }
 
 prompt_playit_secret_key() {
@@ -864,9 +930,7 @@ prompt_playit_secret_key() {
         return 1
     fi
 
-    mkdir -p "$PLAYIT_DIR"
-    printf '%s' "$secret_key" > "$PLAYIT_SECRET_FILE"
-    chmod 600 "$PLAYIT_SECRET_FILE" 2>/dev/null || true
+    playit_write_secret_config "$secret_key"
     cecho "32" "Playit secret key saved."
     return 0
 }
@@ -881,10 +945,6 @@ open_playit_secret_page() {
     echo "If Android asks which browser to use, pick one."
     echo "After copying the key, return to Termux."
     termux-open-url "$PLAYIT_SECRET_URL" 2>/dev/null || am start -a android.intent.action.VIEW -d "$PLAYIT_SECRET_URL" >/dev/null 2>&1 || true
-}
-
-playit_has_secret() {
-    [ -s "$PLAYIT_SECRET_FILE" ]
 }
 
 auto_setup_playit() {
@@ -905,10 +965,10 @@ auto_setup_playit() {
         return 1
     fi
 
-    if ! playit_has_secret && [ ! -f "$PLAYIT_CONFIG_FILE" ]; then
+    if ! playit_has_secret; then
         echo ""
         echo "Trying full automatic Playit claim..."
-        if ! playit_create_guest_secret; then
+        if ! playit_auto_claim_secret; then
             cecho "31" "Automatic Playit setup failed."
             cecho "33" "Returning to the Playit menu."
             return 1
@@ -944,7 +1004,7 @@ start_playit_background() {
         return 1
     fi
 
-    mkdir -p "$PLAYIT_CONFIG_DIR"
+    mkdir -p "$PLAYIT_DIR"
 
     if playit_is_running; then
         cecho "33" "playit is already running."
@@ -1058,17 +1118,50 @@ open_server_folder() {
         return 1
     fi
 
+    local shared_root export_dir doc_uri
+
     clear
     line
     echo "Open server folder"
     line
-    echo "Path: $SERVER_DIR"
-    echo "Type 'exit' to return to the Minecraft hub."
-    printf '\n'
-    cd "$SERVER_DIR"
-    ls -la
-    printf '\n'
-    ${SHELL:-bash}
+    echo "Preparing Android Files view..."
+
+    if [ ! -d "$HOME/storage/shared" ]; then
+        echo ""
+        echo "Setting up Termux shared storage access..."
+        termux-setup-storage >/dev/null 2>&1 || true
+        sleep 2
+    fi
+
+    shared_root="$HOME/storage/shared"
+    if [ ! -d "$shared_root" ]; then
+        cecho "31" "Shared storage is not available in Termux."
+        cecho "33" "Open Termux and grant storage permission first."
+        return 1
+    fi
+
+    export_dir="$shared_root/CellhasherMCServer"
+    rm -rf "$export_dir"
+    mkdir -p "$export_dir"
+
+    if command -v rsync >/dev/null 2>&1; then
+        rsync -a --delete "$SERVER_DIR"/ "$export_dir"/
+    else
+        cp -a "$SERVER_DIR"/. "$export_dir"/
+    fi
+
+    echo "Exported server files to: $export_dir"
+
+    doc_uri="content://com.android.externalstorage.documents/document/primary%3ACellhasherMCServer"
+
+    termux-open "$export_dir" >/dev/null 2>&1 \
+        || am start -a android.intent.action.VIEW -d "$doc_uri" >/dev/null 2>&1 \
+        || am start -a android.intent.action.VIEW -d "file://$export_dir" >/dev/null 2>&1 \
+        || true
+
+    echo ""
+    echo "If Android did not open the folder automatically,"
+    echo "open Files and browse to: Internal storage/CellhasherMCServer"
 }
 
 change_ram() {
