@@ -379,7 +379,7 @@ write_start_script() {
     local min_mb max_mb
     read -r min_mb max_mb <<< "$(get_memory_flags)"
 
-    cat > "$START_SCRIPT" <<EOF
+cat > "$START_SCRIPT" <<EOF
 #!/data/data/com.termux/files/usr/bin/bash
 set -e
 BASE_DIR="\$HOME/cellhasher-mc"
@@ -388,13 +388,27 @@ SERVER_JAR="${SERVER_JAR}"
 MIN_MB="${min_mb}"
 MAX_MB="${max_mb}"
 
+get_start_ip() {
+    local ip_addr
+    ip_addr=$(ip addr show wlan0 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 | head -n1)
+    if [ -z "$ip_addr" ]; then
+        ip_addr=$(ip route 2>/dev/null | awk '/src/ {print $NF}' | head -n1)
+    fi
+    if [ -z "$ip_addr" ]; then
+        ip_addr="Unknown"
+    fi
+    printf '%s' "$ip_addr"
+}
+
 if [ ! -f "\$SERVER_DIR/\$SERVER_JAR" ]; then
     echo "Server jar not found: \$SERVER_DIR/\$SERVER_JAR"
     exit 1
 fi
 
 cd "\$SERVER_DIR"
+SERVER_IP="\$(get_start_ip)"
 echo "Starting ${SERVER_TYPE} ${MC_VERSION} with -Xms\${MIN_MB}M -Xmx\${MAX_MB}M"
+echo "Connect to: \${SERVER_IP}:25565"
 java -Xms\${MIN_MB}M -Xmx\${MAX_MB}M -jar "\$SERVER_JAR" nogui
 EOF
     chmod +x "$START_SCRIPT"
