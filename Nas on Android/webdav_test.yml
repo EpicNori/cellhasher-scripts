@@ -1,0 +1,8 @@
+address: 127.0.0.1
+port: 8092
+directory: /data/data/com.termux/files/home/cellhasher-nas/data/storage
+permissions: R
+users:
+  - username: admin
+    password: admin123
+    permissions: CRUD

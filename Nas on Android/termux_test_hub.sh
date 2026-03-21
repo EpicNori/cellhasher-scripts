@@ -1,54 +1,3 @@
-#!/usr/bin/env python3
-"""
-Cellhasher Android NAS Hub
-"""
-
-import json
-import os
-import ssl
-import subprocess
-import sys
-import tempfile
-import time
-import urllib.request
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
-
-if sys.platform == "win32":
-    try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-    except Exception:
-        pass
-
-
-CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
-ADB = os.environ.get("adb_path", "adb")
-devices = [device for device in os.environ.get("devices", "").split() if device]
-TERMUX_RELEASES_API = "https://api.github.com/repos/termux/termux-app/releases/latest"
-
-SCRIPT_META = {
-    "id": "android-nas-hub-v1",
-    "name": "Android NAS Hub",
-    "description": "Interactive Android NAS management hub for Cellhasher. Installs and manages a small multi-user WebDAV NAS in Termux, supports tunnel access, and syncs with external datakeeper targets.",
-    "category": "Storage",
-    "type": "python",
-    "version": "1.0.0",
-    "author": "Cellhasher Team",
-    "difficulty": "Advanced",
-    "estimatedTime": "10-20 min",
-    "tags": ["android", "nas", "termux", "webdav", "dufs", "localtunnel", "rclone", "storage", "backup"],
-    "effects": {
-        "power": {"reboot": False, "shutdown": False},
-        "security": {"modifiesLockScreen": False},
-    },
-    "estimatedDurationSec": 1200,
-    "downloads": 0,
-    "rating": 5.0,
-    "lastUpdated": "2026-03-21",
-}
-
-TERMUX_HUB_SCRIPT = r"""
 #!/data/data/com.termux/files/usr/bin/bash
 set +e
 
@@ -60,10 +9,10 @@ LOG_DIR="$BASE_DIR/logs"
 STATE_DIR="$BASE_DIR/state"
 TMP_DIR="$BASE_DIR/tmp"
 RUNTIME_ENV="$ETC_DIR/runtime.env"
-DUFS_BIN="$BIN_DIR/webdav"
-DUFS_CONFIG="$ETC_DIR/webdav.yaml"
-DUFS_PID_FILE="$STATE_DIR/webdav.pid"
-DUFS_LOG_FILE="$LOG_DIR/webdav.log"
+DUFS_BIN="$BIN_DIR/dufs"
+DUFS_CONFIG="$ETC_DIR/dufs.yaml"
+DUFS_PID_FILE="$STATE_DIR/dufs.pid"
+DUFS_LOG_FILE="$LOG_DIR/dufs.log"
 INSTALL_LOG_FILE="$LOG_DIR/install.log"
 SYNC_LOG_FILE="$LOG_DIR/sync.log"
 TUNNEL_PID_FILE="$STATE_DIR/tunnel.pid"
@@ -190,38 +139,8 @@ get_device_ip() {
     printf '%s' "$ip_addr"
 }
 
-nas_binary_installed() {
-    [ -x "$DUFS_BIN" ]
-}
-
-nas_config_present() {
-    [ -f "$DUFS_CONFIG" ]
-}
-
-nas_config_valid() {
-    nas_config_present || return 1
-    grep -q '^address:' "$DUFS_CONFIG" 2>/dev/null || return 1
-    grep -q '^port:' "$DUFS_CONFIG" 2>/dev/null || return 1
-    grep -q '^directory:' "$DUFS_CONFIG" 2>/dev/null || return 1
-    grep -q '^users:' "$DUFS_CONFIG" 2>/dev/null || return 1
-}
-
 nas_installed() {
-    nas_binary_installed && nas_config_valid
-}
-
-nas_install_state() {
-    if nas_installed; then
-        printf '%s' 'installed'
-    elif nas_binary_installed && nas_config_present; then
-        printf '%s' 'partial (config invalid)'
-    elif nas_binary_installed; then
-        printf '%s' 'partial (binary only)'
-    elif nas_config_present; then
-        printf '%s' 'partial (config only)'
-    else
-        printf '%s' 'not installed'
-    fi
+    [ -x "$DUFS_BIN" ] && [ -f "$DUFS_CONFIG" ]
 }
 
 nas_is_running() {
@@ -273,7 +192,7 @@ dashboard_header() {
     ensure_storage_layout
     local ip_addr install_state run_state tunnel_state tunnel_url
     ip_addr=$(get_device_ip)
-    install_state=$(nas_install_state)
+    if nas_installed; then install_state="installed"; else install_state="not installed"; fi
     if nas_is_running; then run_state="running"; else run_state="stopped"; fi
     if tunnel_is_running; then tunnel_state="running"; else tunnel_state="stopped"; fi
     tunnel_url=$(extract_tunnel_url || true)
@@ -312,9 +231,8 @@ show_status_screen() {
     else
         echo "Loopback     : curl not installed yet"
     fi
-    echo "webdav bin   : $( [ -x "$DUFS_BIN" ] && printf yes || printf no )"
-    echo "webdav conf  : $( [ -f "$DUFS_CONFIG" ] && printf yes || printf no )"
-    echo "conf valid   : $( nas_config_valid && printf yes || printf no )"
+    echo "dufs binary  : $( [ -x "$DUFS_BIN" ] && printf yes || printf no )"
+    echo "dufs config  : $( [ -f "$DUFS_CONFIG" ] && printf yes || printf no )"
 }
 
 show_info_screen() {
@@ -323,7 +241,7 @@ show_info_screen() {
     line
     echo "Info"
     line
-    echo "This phone exposes a small WebDAV NAS through the MIT-licensed hacdias/webdav server inside Termux."
+    echo "This phone exposes a small WebDAV NAS through dufs inside Termux."
     echo ""
     echo "Access layers:"
     echo "  admin    -> full read/write access to the whole NAS"
@@ -342,68 +260,58 @@ ensure_base_packages() {
     } >> "$INSTALL_LOG_FILE" 2>&1
 }
 
-install_dufs() {
-    local release_json download_url archive_path extract_dir webdav_path version
+detect_dufs_asset() {
     case "$(uname -m)" in
-        aarch64|arm64) download_url="https://github.com/hacdias/webdav/releases/latest/download/linux-arm64-webdav.tar.gz" ;;
-        *) cecho "31" "Unsupported device architecture for webdav: $(uname -m)"; return 1 ;;
+        aarch64|arm64) printf '%s' 'aarch64-unknown-linux-musl.tar.gz' ;;
+        armv7l|armv8l|arm) printf '%s' 'armv7-unknown-linux-musleabihf.tar.gz' ;;
+        x86_64) printf '%s' 'x86_64-unknown-linux-musl.tar.gz' ;;
+        i686|i386) printf '%s' 'i686-unknown-linux-musl.tar.gz' ;;
+        *) return 1 ;;
     esac
-    echo "[2/4] Fetching webdav release metadata..."
-    release_json=$(curl -fsSL "https://api.github.com/repos/hacdias/webdav/releases/latest") || { cecho "31" "Could not fetch webdav release metadata."; return 1; }
+}
+
+install_dufs() {
+    local release_json asset_needle download_url archive_path extract_dir dufs_path version
+    asset_needle=$(detect_dufs_asset) || { cecho "31" "Unsupported device architecture for dufs: $(uname -m)"; return 1; }
+    echo "[2/4] Fetching dufs release metadata..."
+    release_json=$(curl -fsSL "https://api.github.com/repos/sigoden/dufs/releases/latest") || { cecho "31" "Could not fetch dufs release metadata."; return 1; }
     version=$(printf '%s' "$release_json" | jq -r '.tag_name // empty' | sed 's/^v//')
-    archive_path="$TMP_DIR/webdav.tar.gz"
-    extract_dir="$TMP_DIR/webdav-extract"
+    download_url=$(printf '%s' "$release_json" | jq -r --arg needle "$asset_needle" '.assets[] | select(.name | contains($needle)) | .browser_download_url' | head -n1)
+    if [ -z "$download_url" ]; then cecho "31" "Could not find a matching dufs binary asset."; return 1; fi
+    archive_path="$TMP_DIR/dufs.tar.gz"
+    extract_dir="$TMP_DIR/dufs-extract"
     rm -rf "$extract_dir"
     mkdir -p "$extract_dir"
-    echo "[3/4] Downloading webdav $version..."
-    curl -fL "$download_url" -o "$archive_path" >> "$INSTALL_LOG_FILE" 2>&1 || { cecho "31" "Failed to download webdav."; return 1; }
-    echo "[4/4] Unpacking and installing webdav..."
-    tar -xzf "$archive_path" -C "$extract_dir" >> "$INSTALL_LOG_FILE" 2>&1 || { cecho "31" "Failed to unpack webdav."; return 1; }
-    webdav_path=$(find "$extract_dir" -type f -name webdav | head -n1)
-    if [ -z "$webdav_path" ]; then cecho "31" "webdav binary was not found after unpacking."; return 1; fi
-    cp "$webdav_path" "$DUFS_BIN"
+    echo "[3/4] Downloading dufs $version..."
+    curl -fL "$download_url" -o "$archive_path" >> "$INSTALL_LOG_FILE" 2>&1 || { cecho "31" "Failed to download dufs."; return 1; }
+    echo "[4/4] Unpacking and installing dufs..."
+    tar -xzf "$archive_path" -C "$extract_dir" >> "$INSTALL_LOG_FILE" 2>&1 || { cecho "31" "Failed to unpack dufs."; return 1; }
+    dufs_path=$(find "$extract_dir" -type f -name dufs | head -n1)
+    if [ -z "$dufs_path" ]; then cecho "31" "dufs binary was not found after unpacking."; return 1; fi
+    cp "$dufs_path" "$DUFS_BIN"
     chmod 755 "$DUFS_BIN"
     DUFS_VERSION="$version"
     save_runtime
-    cecho "32" "webdav $version installed."
+    cecho "32" "dufs $version installed."
 }
 
 write_dufs_config() {
     ensure_storage_layout
     cat > "$DUFS_CONFIG" <<EOF
-address: $(yaml_value "$NAS_BIND")
+serve-path: '$(yaml_value "$NAS_ROOT")'
+bind: '$(yaml_value "$NAS_BIND")'
 port: $NAS_PORT
-directory: $(yaml_value "$NAS_ROOT")
-permissions: R
-log:
-  format: console
-  colors: false
-  outputs:
-    - stderr
-users:
-  - username: $(yaml_value "$ADMIN_USER")
-    password: $(yaml_value "$ADMIN_PASS")
-    permissions: CRUD
-  - username: $(yaml_value "$UPLOADER_USER")
-    password: $(yaml_value "$UPLOADER_PASS")
-    directory: $(yaml_value "$NAS_ROOT")
-    permissions: none
-    rules:
-      - path: /shared/public/
-        permissions: R
-      - path: /shared/upload/
-        permissions: CRUD
-      - path: /users/$(yaml_value "$UPLOADER_USER")/
-        permissions: CRUD
-  - username: $(yaml_value "$VIEWER_USER")
-    password: $(yaml_value "$VIEWER_PASS")
-    directory: $(yaml_value "$NAS_ROOT")
-    permissions: none
-    rules:
-      - path: /shared/public/
-        permissions: R
-      - path: /users/$(yaml_value "$VIEWER_USER")/
-        permissions: R
+auth:
+  - '$(yaml_value "$ADMIN_USER"):$(yaml_value "$ADMIN_PASS")@/:rw'
+  - '$(yaml_value "$UPLOADER_USER"):$(yaml_value "$UPLOADER_PASS")@/shared/upload:rw,/users/$(yaml_value "$UPLOADER_USER"):rw,/shared/public'
+  - '$(yaml_value "$VIEWER_USER"):$(yaml_value "$VIEWER_PASS")@/shared/public,/users/$(yaml_value "$VIEWER_USER")'
+allow-upload: true
+allow-delete: true
+allow-search: true
+allow-archive: true
+render-index: true
+render-try-index: true
+log-file: '$(yaml_value "$DUFS_LOG_FILE")'
 EOF
 }
 
@@ -432,41 +340,38 @@ install_or_reinstall_nas() {
         [ -f "$INSTALL_LOG_FILE" ] && tail -n 40 "$INSTALL_LOG_FILE"
         return 1
     }
-    echo "Writing WebDAV NAS config and folders..."
+    echo "Writing NAS config and folders..."
     ensure_storage_layout
     write_dufs_config
     LAST_INSTALL_AT=$(date '+%F %T')
     save_runtime
-    cecho "32" "NAS installed or refreshed with webdav."
+    cecho "32" "NAS installed or refreshed."
 }
 
 start_nas() {
     load_runtime
-    if ! nas_binary_installed; then
-        cecho "31" "NAS binary is not installed yet. Use install or reinstall first."
-        return 1
-    fi
-    if ! nas_config_valid; then
-        cecho "31" "NAS config is missing or invalid."
-        cecho "33" "Use install or reinstall NAS, or save/regenerate the NAS config first."
-        if nas_config_present; then
-            echo ""
-            echo "Current config file:"
-            cat "$DUFS_CONFIG"
-        fi
-        return 1
-    fi
+    if ! nas_installed; then cecho "31" "NAS is not installed yet. Use install or reinstall first."; return 1; fi
     if nas_is_running; then cecho "33" "NAS is already running."; return 0; fi
     write_dufs_config
-    if ! "$DUFS_BIN" version >/dev/null 2>&1; then
-        cecho "31" "webdav binary is installed but could not execute."
+    if ! "$DUFS_BIN" --version >/dev/null 2>&1; then
+        cecho "31" "dufs binary is installed but could not execute."
         cecho "31" "Reinstall the NAS and check the install log."
         return 1
     fi
     clear_log_if_huge "$DUFS_LOG_FILE"
-    nohup "$DUFS_BIN" -c "$DUFS_CONFIG" >> "$DUFS_LOG_FILE" 2>&1 &
+    nohup "$DUFS_BIN" "$NAS_ROOT" \
+        --bind "${NAS_BIND}:${NAS_PORT}" \
+        --auth "$ADMIN_USER:$ADMIN_PASS@/:rw" \
+        --auth "$UPLOADER_USER:$UPLOADER_PASS@/shared/upload:rw,/users/$UPLOADER_USER:rw,/shared/public" \
+        --auth "$VIEWER_USER:$VIEWER_PASS@/shared/public,/users/$VIEWER_USER" \
+        --allow-upload \
+        --allow-delete \
+        --allow-search \
+        --allow-archive \
+        --render-try-index \
+        --log-file "$DUFS_LOG_FILE" >> "$DUFS_LOG_FILE" 2>&1 &
     echo $! > "$DUFS_PID_FILE"
-    sleep 3
+    sleep 2
     if nas_is_running; then
         cecho "32" "NAS started."
         cecho "32" "LAN URL: http://$(get_device_ip):$NAS_PORT/"
@@ -517,13 +422,7 @@ EOF
 show_full_nas_config() {
     dashboard_header
     printf '\n'
-    if [ -f "$DUFS_CONFIG" ]; then
-        cat "$DUFS_CONFIG"
-        echo ""
-        echo "Valid config: $( nas_config_valid && printf yes || printf no )"
-    else
-        echo "No NAS config written yet."
-    fi
+    if [ -f "$DUFS_CONFIG" ]; then cat "$DUFS_CONFIG"; else echo "No NAS config written yet."; fi
 }
 
 change_nas_port() {
@@ -752,185 +651,3 @@ main_menu() {
 }
 
 main_menu
-"""
-
-def create_ssl_context():
-    try:
-        return ssl._create_unverified_context()
-    except Exception:
-        return ssl.create_default_context()
-
-
-def run_command(command, *, text=False, timeout=None):
-    kwargs = {"capture_output": True, "timeout": timeout}
-    if text:
-        kwargs["text"] = True
-    if sys.platform == "win32":
-        kwargs["creationflags"] = CREATE_NO_WINDOW
-    return subprocess.run(command, **kwargs)
-
-
-def fetch_json(url):
-    request = urllib.request.Request(url, headers={"User-Agent": "Cellhasher-Android-NAS-Hub/1.0"})
-    with urllib.request.urlopen(request, timeout=30, context=create_ssl_context()) as response:
-        return json.loads(response.read().decode("utf-8"))
-
-
-def get_latest_termux_apk():
-    release_data = fetch_json(TERMUX_RELEASES_API)
-    assets = release_data.get("assets", [])
-    preferred_names = ["arm64-v8a", "universal", "apk"]
-    for needle in preferred_names:
-        for asset in assets:
-            name = asset.get("name", "").lower()
-            if needle in name and name.endswith(".apk"):
-                return asset["browser_download_url"], asset["name"], release_data.get("tag_name", "latest")
-    raise RuntimeError("No suitable Termux APK found in latest release")
-
-
-def download_file(url, filename):
-    local_path = os.path.join(tempfile.gettempdir(), filename)
-    request = urllib.request.Request(url, headers={"User-Agent": "Cellhasher-Android-NAS-Hub/1.0"})
-    with urllib.request.urlopen(request, timeout=180, context=create_ssl_context()) as response, open(local_path, "wb") as handle:
-        while True:
-            chunk = response.read(1024 * 128)
-            if not chunk:
-                break
-            handle.write(chunk)
-    return local_path
-
-
-def check_termux_installed(device_id):
-    result = run_command([ADB, "-s", device_id, "shell", "pm", "list", "packages", "com.termux"], text=True, timeout=30)
-    return "com.termux" in (result.stdout or "")
-
-
-def install_termux(device_id, apk_path):
-    result = run_command([ADB, "-s", device_id, "install", "-r", apk_path], text=True, timeout=180)
-    output = f"{result.stdout or ''}\n{result.stderr or ''}"
-    return result.returncode == 0 or "Success" in output
-
-
-def grant_termux_permissions(device_id):
-    permissions = [
-        "android.permission.WRITE_EXTERNAL_STORAGE",
-        "android.permission.READ_EXTERNAL_STORAGE",
-        "android.permission.INTERNET",
-        "android.permission.ACCESS_NETWORK_STATE",
-        "android.permission.WAKE_LOCK",
-        "android.permission.FOREGROUND_SERVICE",
-    ]
-    for permission in permissions:
-        try:
-            run_command([ADB, "-s", device_id, "shell", "pm", "grant", "com.termux", permission], timeout=20)
-        except Exception:
-            pass
-
-
-def launch_hub_on_device(device_id, local_script_path):
-    device_script_path = "/data/local/tmp/cellhasher_android_nas_hub.sh"
-    run_command([ADB, "-s", device_id, "shell", "am", "force-stop", "com.termux"], timeout=20)
-    time.sleep(1)
-    push_result = run_command([ADB, "-s", device_id, "push", local_script_path, device_script_path], text=True, timeout=60)
-    if push_result.returncode != 0:
-        return f"[{device_id}] Error: failed to push Termux NAS hub script"
-    run_command([ADB, "-s", device_id, "shell", "chmod", "755", device_script_path], timeout=20)
-    grant_termux_permissions(device_id)
-    run_command([ADB, "-s", device_id, "shell", "am", "start", "-n", "com.termux/com.termux.app.TermuxActivity"], timeout=30)
-    time.sleep(15)
-    run_command([ADB, "-s", device_id, "shell", "input", "text", "bash%s/data/local/tmp/cellhasher_android_nas_hub.sh"], timeout=20)
-    time.sleep(0.5)
-    run_command([ADB, "-s", device_id, "shell", "input", "keyevent", "66"], timeout=20)
-    return f"[{device_id}] Success: Android NAS hub opened in Termux"
-
-
-def ensure_termux_on_devices(selected_devices):
-    ready_devices = []
-    missing_devices = []
-    for device_id in selected_devices:
-        if check_termux_installed(device_id):
-            print(f"[{device_id}] Termux already installed")
-            ready_devices.append(device_id)
-        else:
-            print(f"[{device_id}] Termux missing")
-            missing_devices.append(device_id)
-    if not missing_devices:
-        return ready_devices
-
-    print()
-    print("[*] Downloading latest Termux APK...")
-    apk_url, apk_name, tag_name = get_latest_termux_apk()
-    print(f"[*] Termux release: {tag_name}")
-    apk_path = download_file(apk_url, apk_name)
-    try:
-        with ThreadPoolExecutor(max_workers=min(len(missing_devices), 4)) as executor:
-            future_map = {executor.submit(install_termux, device_id, apk_path): device_id for device_id in missing_devices}
-            for future in as_completed(future_map):
-                device_id = future_map[future]
-                try:
-                    success = future.result()
-                except Exception as exc:
-                    print(f"[{device_id}] Termux install failed: {exc}")
-                    continue
-                if success:
-                    print(f"[{device_id}] Termux installed")
-                    ready_devices.append(device_id)
-                else:
-                    print(f"[{device_id}] Termux installation failed")
-    finally:
-        if os.path.exists(apk_path):
-            os.remove(apk_path)
-    if ready_devices:
-        time.sleep(5)
-    return ready_devices
-
-
-def main():
-    print("=" * 64)
-    print("   Cellhasher Android NAS Hub")
-    print("   Termux | webdav | localtunnel | rclone")
-    print("=" * 64)
-    print()
-    if not devices:
-        print("[ERROR] No devices found in environment variable 'devices'")
-        print("[INFO] Select at least one Android device in Cellhasher and rerun")
-        return
-    print(f"[*] Devices selected: {len(devices)}")
-    for index, device_id in enumerate(devices, start=1):
-        print(f"    {index}. {device_id}")
-    print()
-    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="\n", delete=False, suffix=".sh") as handle:
-        handle.write(TERMUX_HUB_SCRIPT)
-        local_script_path = handle.name
-    try:
-        ready_devices = ensure_termux_on_devices(devices)
-        if not ready_devices:
-            print("[ERROR] No device is ready for Termux deployment")
-            return
-        print()
-        print("[*] Launching the Android NAS hub...")
-        print()
-        with ThreadPoolExecutor(max_workers=min(len(ready_devices), 4)) as executor:
-            future_map = {executor.submit(launch_hub_on_device, device_id, local_script_path): device_id for device_id in ready_devices}
-            for future in as_completed(future_map):
-                try:
-                    print(future.result())
-                except Exception as exc:
-                    device_id = future_map[future]
-                    print(f"[{device_id}] Launch failed: {exc}")
-    finally:
-        if os.path.exists(local_script_path):
-            os.remove(local_script_path)
-    print()
-    print("=" * 64)
-    print("   Next step on the phone")
-    print("=" * 64)
-    print("   1. Termux opens on the selected device.")
-    print("   2. The NAS dashboard and menu appear before any install step.")
-    print("   3. Use 'Install or reinstall NAS' for first-time setup.")
-    print("   4. Use the same hub later to start, stop, reconfigure, sync, and tunnel the NAS.")
-    print("=" * 64)
-
-
-if __name__ == "__main__":
-    main()
