@@ -324,6 +324,7 @@ detect_dufs_asset() {
 install_dufs() {
     local release_json asset_needle download_url archive_path extract_dir dufs_path version
     asset_needle=$(detect_dufs_asset) || { cecho "31" "Unsupported device architecture for dufs: $(uname -m)"; return 1; }
+    echo "[2/4] Fetching dufs release metadata..."
     release_json=$(curl -fsSL "https://api.github.com/repos/sigoden/dufs/releases/latest") || { cecho "31" "Could not fetch dufs release metadata."; return 1; }
     version=$(printf '%s' "$release_json" | jq -r '.tag_name // empty' | sed 's/^v//')
     download_url=$(printf '%s' "$release_json" | jq -r --arg needle "$asset_needle" '.assets[] | select(.name | contains($needle)) | .browser_download_url' | head -n1)
@@ -332,7 +333,9 @@ install_dufs() {
     extract_dir="$TMP_DIR/dufs-extract"
     rm -rf "$extract_dir"
     mkdir -p "$extract_dir"
+    echo "[3/4] Downloading dufs $version..."
     curl -fL "$download_url" -o "$archive_path" >> "$INSTALL_LOG_FILE" 2>&1 || { cecho "31" "Failed to download dufs."; return 1; }
+    echo "[4/4] Unpacking and installing dufs..."
     tar -xzf "$archive_path" -C "$extract_dir" >> "$INSTALL_LOG_FILE" 2>&1 || { cecho "31" "Failed to unpack dufs."; return 1; }
     dufs_path=$(find "$extract_dir" -type f -name dufs | head -n1)
     if [ -z "$dufs_path" ]; then cecho "31" "dufs binary was not found after unpacking."; return 1; fi
@@ -369,11 +372,26 @@ install_or_reinstall_nas() {
     printf '\nContinue? [Y/n]: '
     read -r answer || answer=""
     if [ -n "$answer" ] && ! printf '%s' "$answer" | grep -Eq '^[Yy]$'; then cecho "33" "Installation cancelled."; return 0; fi
+    printf '\n'
+    line
+    echo "Installing NAS"
+    line
+    echo "[1/4] Preparing Termux packages..."
     ensure_base_packages
+    if [ $? -ne 0 ]; then
+        cecho "31" "Package preparation failed."
+        [ -f "$INSTALL_LOG_FILE" ] && tail -n 40 "$INSTALL_LOG_FILE"
+        return 1
+    fi
+    echo "Requesting Termux shared-storage setup..."
     termux-setup-storage >/dev/null 2>&1 || true
     sleep 2
     if nas_is_running; then stop_nas >/dev/null 2>&1; fi
-    install_dufs || return 1
+    install_dufs || {
+        [ -f "$INSTALL_LOG_FILE" ] && tail -n 40 "$INSTALL_LOG_FILE"
+        return 1
+    }
+    echo "Writing NAS config and folders..."
     ensure_storage_layout
     write_dufs_config
     LAST_INSTALL_AT=$(date '+%F %T')
@@ -386,10 +404,38 @@ start_nas() {
     if ! nas_installed; then cecho "31" "NAS is not installed yet. Use install or reinstall first."; return 1; fi
     if nas_is_running; then cecho "33" "NAS is already running."; return 0; fi
     write_dufs_config
-    nohup "$DUFS_BIN" --config "$DUFS_CONFIG" >> "$DUFS_LOG_FILE" 2>&1 &
+    if ! "$DUFS_BIN" --version >/dev/null 2>&1; then
+        cecho "31" "dufs binary is installed but could not execute."
+        cecho "31" "Reinstall the NAS and check the install log."
+        return 1
+    fi
+    clear_log_if_huge "$DUFS_LOG_FILE"
+    nohup "$DUFS_BIN" "$NAS_ROOT" \
+        --bind "$NAS_BIND" \
+        --port "$NAS_PORT" \
+        --auth "$ADMIN_USER:$ADMIN_PASS@/:rw" \
+        --auth "$UPLOADER_USER:$UPLOADER_PASS@/shared/upload:rw,/users/$UPLOADER_USER:rw,/shared/public" \
+        --auth "$VIEWER_USER:$VIEWER_PASS@/shared/public,/users/$VIEWER_USER" \
+        --allow-upload \
+        --allow-delete \
+        --allow-search \
+        --allow-archive \
+        --render-try-index \
+        --log-file "$DUFS_LOG_FILE" >> "$DUFS_LOG_FILE" 2>&1 &
     echo $! > "$DUFS_PID_FILE"
     sleep 2
-    if nas_is_running; then cecho "32" "NAS started."; else cecho "31" "NAS failed to stay running."; return 1; fi
+    if nas_is_running; then
+        cecho "32" "NAS started."
+        cecho "32" "LAN URL: http://$(get_device_ip):$NAS_PORT/"
+    else
+        cecho "31" "NAS failed to stay running."
+        if [ -f "$DUFS_LOG_FILE" ]; then
+            echo ""
+            echo "Recent NAS log:"
+            tail -n 30 "$DUFS_LOG_FILE"
+        fi
+        return 1
+    fi
 }
 
 stop_nas() {
@@ -514,12 +560,122 @@ configure_external_target() { dashboard_header; printf '\n1.none 2.local/shared/
 push_data_to_external() { case "$EXTERNAL_MODE" in local) rsync -a --delete "$NAS_ROOT"/ "$EXTERNAL_PATH"/ >> "$SYNC_LOG_FILE" 2>&1 ;; rclone) rclone sync "$NAS_ROOT" "$RCLONE_REMOTE" >> "$SYNC_LOG_FILE" 2>&1 ;; *) echo "No external target configured."; return 1 ;; esac; echo "Push finished."; }
 pull_data_from_external() { case "$EXTERNAL_MODE" in local) rsync -a "$EXTERNAL_PATH"/ "$NAS_ROOT"/ >> "$SYNC_LOG_FILE" 2>&1 ;; rclone) rclone sync "$RCLONE_REMOTE" "$NAS_ROOT" >> "$SYNC_LOG_FILE" 2>&1 ;; *) echo "No external target configured."; return 1 ;; esac; echo "Pull finished."; }
 
-logs_menu() { dashboard_header; printf '\n'; echo "1.install 2.nas 3.tunnel 4.sync 5.clear 6.back"; read -r c || c=""; case "$c" in 1) [ -f "$INSTALL_LOG_FILE" ] && tail -n 80 "$INSTALL_LOG_FILE" || echo none; pause ;; 2) [ -f "$DUFS_LOG_FILE" ] && tail -n 80 "$DUFS_LOG_FILE" || echo none; pause ;; 3) [ -f "$TUNNEL_LOG_FILE" ] && tail -n 80 "$TUNNEL_LOG_FILE" || echo none; pause ;; 4) [ -f "$SYNC_LOG_FILE" ] && tail -n 80 "$SYNC_LOG_FILE" || echo none; pause ;; 5) : > "$INSTALL_LOG_FILE"; : > "$DUFS_LOG_FILE"; : > "$TUNNEL_LOG_FILE"; : > "$SYNC_LOG_FILE"; echo cleared; pause ;; esac; }
+logs_menu() {
+    while true; do
+        dashboard_header
+        printf '\n'
+        echo "1. Show install log"
+        echo "2. Show NAS log"
+        echo "3. Show tunnel log"
+        echo "4. Show sync log"
+        echo "5. Clear logs"
+        echo "6. Back"
+        printf '\nSelect [1-6]: '
+        read -r c || c=""
+        case "$c" in
+            1) [ -f "$INSTALL_LOG_FILE" ] && tail -n 80 "$INSTALL_LOG_FILE" || echo none; pause ;;
+            2) [ -f "$DUFS_LOG_FILE" ] && tail -n 80 "$DUFS_LOG_FILE" || echo none; pause ;;
+            3) [ -f "$TUNNEL_LOG_FILE" ] && tail -n 80 "$TUNNEL_LOG_FILE" || echo none; pause ;;
+            4) [ -f "$SYNC_LOG_FILE" ] && tail -n 80 "$SYNC_LOG_FILE" || echo none; pause ;;
+            5) : > "$INSTALL_LOG_FILE"; : > "$DUFS_LOG_FILE"; : > "$TUNNEL_LOG_FILE"; : > "$SYNC_LOG_FILE"; echo cleared; pause ;;
+            6|0|b|B|q|Q) return 0 ;;
+        esac
+    done
+}
 
-config_menu() { while true; do dashboard_header; printf '\n1.runtime 2.full config 3.change port 4.external target 5.tunnel config 6.save 7.back\nSelect [1-7]: '; read -r c || c=""; case "$c" in 1) show_runtime_config; pause ;; 2) show_full_nas_config; pause ;; 3) change_nas_port; pause ;; 4) configure_external_target; pause ;; 5) show_tunnel_config; pause ;; 6) write_dufs_config; save_runtime; echo saved; pause ;; 7|0|b|B|q|Q) return 0 ;; esac; done; }
-users_menu() { while true; do dashboard_header; printf '\n1.show users 2.layers 3.edit usernames 4.edit passwords 5.regenerate config 6.show folders 7.back\nSelect [1-7]: '; read -r c || c=""; case "$c" in 1) show_current_users; pause ;; 2) show_access_layers; pause ;; 3) edit_username; pause ;; 4) edit_password; pause ;; 5) rewrite_nas_config_after_user_edits; pause ;; 6) show_user_folders; pause ;; 7|0|b|B|q|Q) return 0 ;; esac; done; }
-tunnel_menu() { while true; do dashboard_header; printf '\n1.status 2.start 3.stop 4.config 5.edit 6.back\nSelect [1-6]: '; read -r c || c=""; case "$c" in 1) show_tunnel_status; pause ;; 2) start_tunnel; pause ;; 3) stop_tunnel; pause ;; 4) show_tunnel_config; pause ;; 5) edit_tunnel_settings; pause ;; 6|0|b|B|q|Q) return 0 ;; esac; done; }
-external_datakeepers_menu() { while true; do dashboard_header; printf '\n1.show target 2.configure 3.push 4.pull 5.back\nSelect [1-5]: '; read -r c || c=""; case "$c" in 1) show_external_target; pause ;; 2) configure_external_target; pause ;; 3) push_data_to_external; pause ;; 4) pull_data_from_external; pause ;; 5|0|b|B|q|Q) return 0 ;; esac; done; }
+config_menu() {
+    while true; do
+        dashboard_header
+        printf '\n'
+        echo "1. Show runtime config"
+        echo "2. Show full NAS config"
+        echo "3. Change NAS/WebDAV port"
+        echo "4. Configure external target"
+        echo "5. Show tunnel config"
+        echo "6. Save changes on-device"
+        echo "7. Back"
+        printf '\nSelect [1-7]: '
+        read -r c || c=""
+        case "$c" in
+            1) show_runtime_config; pause ;;
+            2) show_full_nas_config; pause ;;
+            3) change_nas_port; pause ;;
+            4) configure_external_target; pause ;;
+            5) show_tunnel_config; pause ;;
+            6) write_dufs_config; save_runtime; echo saved; pause ;;
+            7|0|b|B|q|Q) return 0 ;;
+        esac
+    done
+}
+
+users_menu() {
+    while true; do
+        dashboard_header
+        printf '\n'
+        echo "1. Show current users"
+        echo "2. Show access layers"
+        echo "3. Edit usernames"
+        echo "4. Edit passwords"
+        echo "5. Regenerate/write NAS config"
+        echo "6. Show user folders"
+        echo "7. Back"
+        printf '\nSelect [1-7]: '
+        read -r c || c=""
+        case "$c" in
+            1) show_current_users; pause ;;
+            2) show_access_layers; pause ;;
+            3) edit_username; pause ;;
+            4) edit_password; pause ;;
+            5) rewrite_nas_config_after_user_edits; pause ;;
+            6) show_user_folders; pause ;;
+            7|0|b|B|q|Q) return 0 ;;
+        esac
+    done
+}
+
+tunnel_menu() {
+    while true; do
+        dashboard_header
+        printf '\n'
+        echo "1. Show tunnel status"
+        echo "2. Start tunnel"
+        echo "3. Stop tunnel"
+        echo "4. Show tunnel config"
+        echo "5. Edit tunnel settings"
+        echo "6. Back"
+        printf '\nSelect [1-6]: '
+        read -r c || c=""
+        case "$c" in
+            1) show_tunnel_status; pause ;;
+            2) start_tunnel; pause ;;
+            3) stop_tunnel; pause ;;
+            4) show_tunnel_config; pause ;;
+            5) edit_tunnel_settings; pause ;;
+            6|0|b|B|q|Q) return 0 ;;
+        esac
+    done
+}
+
+external_datakeepers_menu() {
+    while true; do
+        dashboard_header
+        printf '\n'
+        echo "1. Show current external target"
+        echo "2. Configure mode"
+        echo "3. Push data to external target"
+        echo "4. Pull data from external target"
+        echo "5. Back"
+        printf '\nSelect [1-5]: '
+        read -r c || c=""
+        case "$c" in
+            1) show_external_target; pause ;;
+            2) configure_external_target; pause ;;
+            3) push_data_to_external; pause ;;
+            4) pull_data_from_external; pause ;;
+            5|0|b|B|q|Q) return 0 ;;
+        esac
+    done
+}
 
 main_menu() {
     load_runtime
