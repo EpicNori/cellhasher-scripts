@@ -4,7 +4,8 @@ Cellhasher Minecraft Android Server Hub
 
 Pushes an interactive Termux management script to Android devices. The on-device
 menu can install Paper, Vanilla, Fabric, or Bukkit servers, change RAM, install
-mods/plugins from Modrinth or CurseForge links, and optionally install playit.
+mods/plugins from Modrinth or CurseForge links, and set up remote access with
+playit or Pinggy.
 """
 
 import json
@@ -35,7 +36,7 @@ TERMUX_RELEASES_API = "https://api.github.com/repos/termux/termux-app/releases/l
 SCRIPT_META = {
     "id": "minecraft-android-server-hub-v1",
     "name": "Minecraft Android Server Hub",
-    "description": "Interactive Android Minecraft server hub for Cellhasher. Installs Paper, Vanilla, Fabric, or Bukkit in Termux, lets you set RAM, install add-ons from Modrinth or CurseForge links, and optionally installs playit tunneling.",
+    "description": "Interactive Android Minecraft server hub for Cellhasher. Installs Paper, Vanilla, Fabric, or Bukkit in Termux, lets you set RAM, install add-ons from Modrinth or CurseForge links, and sets up remote access with playit or Pinggy.",
     "category": "Gaming",
     "type": "python",
     "version": "1.0.0",
@@ -54,6 +55,7 @@ SCRIPT_META = {
         "modrinth",
         "curseforge",
         "playit",
+        "pinggy",
     ],
     "effects": {
         "power": {"reboot": False, "shutdown": False},
@@ -84,6 +86,10 @@ PLAYIT_LOG_FILE="$PLAYIT_DIR/playit.log"
 PLAYIT_AGENT_BOOT_LOG="$PLAYIT_DIR/playit-boot.log"
 PLAYIT_SECRET_URL="https://playit.gg/account/agents"
 PLAYIT_API_BASE="https://api.playit.gg"
+PINGGY_DIR="$BASE_DIR/pinggy"
+PINGGY_PID_FILE="$PINGGY_DIR/pinggy.pid"
+PINGGY_LOG_FILE="$PINGGY_DIR/pinggy.log"
+PINGGY_API_PORT="4300"
 USER_AGENT="Cellhasher-Minecraft-Hub/1.0 (https://github.com/)"
 
 mkdir -p "$BASE_DIR" "$SERVER_DIR" "$STATE_DIR"
@@ -100,7 +106,7 @@ line() {
 
 pause() {
     printf '\nPress ENTER to continue...'
-    read -r _
+    read -r _ || true
 }
 
 load_state() {
@@ -138,7 +144,7 @@ get_device_ip() {
 
 show_connection_info() {
     load_state
-    local ip_addr
+    local ip_addr playit_endpoint pinggy_endpoint
     ip_addr=$(get_device_ip)
     clear
     line
@@ -150,10 +156,25 @@ show_connection_info() {
     echo "IP          : ${ip_addr}"
     echo "Port        : 25565"
     echo "LAN join    : ${ip_addr}:25565"
-    if [ -x "$PLAYIT_DIR/playit" ]; then
+    playit_endpoint=$(playit_get_endpoint || true)
+    if [ -n "$playit_endpoint" ]; then
+        echo "playit      : $playit_endpoint"
+    elif playit_is_running; then
+        echo "playit      : running"
+    elif [ -x "$PLAYIT_DIR/playit" ]; then
         echo "playit      : installed"
     else
         echo "playit      : not installed"
+    fi
+    pinggy_endpoint=$(pinggy_get_endpoint || true)
+    if [ -n "$pinggy_endpoint" ]; then
+        echo "pinggy      : $pinggy_endpoint"
+    elif pinggy_is_running; then
+        echo "pinggy      : running"
+    elif [ -f "$PINGGY_LOG_FILE" ]; then
+        echo "pinggy      : configured"
+    else
+        echo "pinggy      : not running"
     fi
 }
 
@@ -164,7 +185,7 @@ ensure_packages() {
     line
     pkg update -y || true
     yes '' | pkg upgrade -y 2>/dev/null || true
-    pkg install -y openjdk-21 curl jq unzip tar git
+    pkg install -y openjdk-21 curl jq unzip tar git openssh
 }
 
 prompt_server_type() {
@@ -178,7 +199,10 @@ prompt_server_type() {
         echo "3. Fabric"
         echo "4. Bukkit (BuildTools / CraftBukkit)"
         printf '\nSelect [1-4]: '
-        read -r choice
+        read -r choice || {
+            choice=""
+            continue
+        }
         case "$choice" in
             1) SERVER_TYPE="paper"; return ;;
             2) SERVER_TYPE="vanilla"; return ;;
@@ -196,7 +220,7 @@ prompt_minecraft_version() {
     local latest_version
     latest_version=$(get_latest_release_version)
     printf '\nMinecraft version [latest=%s, press ENTER for latest]: ' "$latest_version"
-    read -r requested_version
+    read -r requested_version || requested_version=""
     if [ -z "$requested_version" ]; then
         MC_VERSION="$latest_version"
     else
@@ -208,7 +232,7 @@ prompt_ram() {
     local default_value="${1:-2}"
     while true; do
         printf '\nRAM in GB [%s]: ' "$default_value"
-        read -r requested_ram
+        read -r requested_ram || requested_ram=""
         if [ -z "$requested_ram" ]; then
             RAM_GB="$default_value"
             return
@@ -517,7 +541,7 @@ install_addons() {
     echo "  https://modrinth.com/mod/fabric-api"
     echo "  https://www.curseforge.com/minecraft/mc-mods/example/files/1234567"
     printf '\nLinks (space separated): '
-    read -r raw_input
+    read -r raw_input || raw_input=""
 
     if [ -z "$raw_input" ]; then
         return 0
@@ -850,8 +874,48 @@ playit_is_running() {
     return 1
 }
 
+playit_get_endpoint() {
+    local secret_key agent_id tunnels_json endpoint
+
+    secret_key=$(playit_get_secret_key || true)
+    if [ -z "$secret_key" ]; then
+        return 1
+    fi
+
+    agent_id=$(playit_get_agent_id || true)
+    if [ -z "$agent_id" ]; then
+        return 1
+    fi
+
+    tunnels_json=$(playit_api_post "tunnels/list" "agent-key $secret_key" "{\"agent_id\":\"$agent_id\"}" || true)
+    endpoint=$(printf '%s' "$tunnels_json" | jq -r '
+        .data.tunnels[]?
+        | select((.origin.data.local_port|tostring) == "25565")
+        | (
+            .assigned_domain // .domain // .tunnel_domain // .hostname // .public_host // .host // empty
+          ) as $host
+        | (
+            .assigned_port // .port // .public_port // .external_port // empty
+          ) as $port
+        | if ($host | tostring | length) > 0 and ($port | tostring | length) > 0 then
+            "\($host):\($port)"
+          elif ($host | tostring | length) > 0 then
+            $host
+          else
+            empty
+          end
+    ' 2>/dev/null | head -n1)
+
+    if [ -n "$endpoint" ]; then
+        printf '%s' "$endpoint"
+        return 0
+    fi
+
+    return 1
+}
+
 playit_status() {
-    local secret_key agent_version agent_id
+    local secret_key agent_version agent_id endpoint
 
     clear
     line
@@ -884,6 +948,10 @@ playit_status() {
         if [ -n "$agent_id" ]; then
             echo "Agent  : $agent_id"
         fi
+        endpoint=$(playit_get_endpoint || true)
+        if [ -n "$endpoint" ]; then
+            echo "Tunnel : $endpoint"
+        fi
     else
         echo "Secret : not saved"
     fi
@@ -914,7 +982,7 @@ link_playit() {
     echo "Use the shown URL/code to link the device to your playit account."
     echo "After linking succeeds, press Ctrl+C to return to this menu."
     printf '\nPress ENTER to continue...'
-    read -r _
+    read -r _ || true
 
     cd "$PLAYIT_DIR"
     "$PLAYIT_DIR/playit" -s --secret_path "$PLAYIT_CONFIG_FILE" || true
@@ -923,7 +991,7 @@ link_playit() {
 prompt_playit_secret_key() {
     local secret_key
     printf '\nEnter Playit secret key (leave blank to skip): '
-    read -r -s secret_key
+    read -r -s secret_key || secret_key=""
     printf '\n'
 
     if [ -z "$secret_key" ]; then
@@ -952,8 +1020,8 @@ auto_setup_playit() {
     line
     echo "Auto playit setup"
     line
-    echo "This mode tries the same automatic guest-claim flow used by auto-mcs."
-    echo "If that fails, it returns to the Playit menu without manual fallback."
+    echo "This mode tries the automatic Playit guest-claim flow first."
+    echo "If Playit fails, it falls back to Pinggy automatically."
 
     if [ ! -x "$PLAYIT_DIR/playit" ]; then
         echo "Installing playit..."
@@ -969,15 +1037,21 @@ auto_setup_playit() {
         echo ""
         echo "Trying full automatic Playit claim..."
         if ! playit_auto_claim_secret; then
-            cecho "31" "Automatic Playit setup failed."
-            cecho "33" "Returning to the Playit menu."
-            return 1
+            cecho "33" "Automatic Playit setup failed."
+            cecho "33" "Trying Pinggy fallback instead..."
+            auto_setup_pinggy
+            return $?
         fi
     fi
 
     if playit_has_secret; then
         playit_ensure_tunnel 25565 tcp || true
-        start_playit_background || return 1
+        if ! start_playit_background; then
+            cecho "33" "Playit could not stay running."
+            cecho "33" "Trying Pinggy fallback instead..."
+            auto_setup_pinggy
+            return $?
+        fi
         cecho "32" "Auto playit setup finished using automatic API mode."
         return 0
     fi
@@ -992,8 +1066,154 @@ auto_playit_site_only() {
     line
     open_playit_secret_page
     printf '\nPress ENTER after you copied the key and returned to Termux...'
-    read -r _
+    read -r _ || true
     prompt_playit_secret_key
+}
+
+pinggy_get_endpoint() {
+    local endpoint
+
+    endpoint=$(curl -fsSL "http://127.0.0.1:${PINGGY_API_PORT}/urls" 2>/dev/null | jq -r '.tcp_urls[0] // .urls[0] // empty' 2>/dev/null || true)
+    if [ -n "$endpoint" ]; then
+        printf '%s' "$endpoint"
+        return 0
+    fi
+
+    if [ ! -f "$PINGGY_LOG_FILE" ]; then
+        return 1
+    fi
+
+    grep -ao 'tcp://[^[:space:]]*' "$PINGGY_LOG_FILE" 2>/dev/null | tail -n1
+}
+
+pinggy_is_running() {
+    local pid
+
+    if [ ! -f "$PINGGY_PID_FILE" ]; then
+        return 1
+    fi
+
+    pid=$(cat "$PINGGY_PID_FILE" 2>/dev/null || true)
+    if [ -z "$pid" ]; then
+        rm -f "$PINGGY_PID_FILE"
+        return 1
+    fi
+
+    if kill -0 "$pid" 2>/dev/null; then
+        return 0
+    fi
+
+    rm -f "$PINGGY_PID_FILE"
+    return 1
+}
+
+pinggy_start_background() {
+    local ssh_cmd endpoint attempt
+
+    mkdir -p "$PINGGY_DIR"
+
+    if pinggy_is_running; then
+        cecho "33" "pinggy is already running."
+        return 0
+    fi
+
+    ssh_cmd='while true; do yes "" | ssh -p 443 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o NumberOfPasswordPrompts=1 -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -L'"${PINGGY_API_PORT}"':127.0.0.1:4300 -R0:localhost:25565 tcp@a.pinggy.io; sleep 5; done'
+
+    : > "$PINGGY_LOG_FILE"
+    nohup sh -c "$ssh_cmd" > "$PINGGY_LOG_FILE" 2>&1 &
+    echo $! > "$PINGGY_PID_FILE"
+
+    endpoint=""
+    for attempt in $(seq 1 20); do
+        if ! pinggy_is_running; then
+            break
+        fi
+        endpoint=$(pinggy_get_endpoint || true)
+        if [ -n "$endpoint" ]; then
+            cecho "32" "pinggy started in the background."
+            cecho "32" "Public tunnel: $endpoint"
+            return 0
+        fi
+        sleep 1
+    done
+
+    cecho "31" "pinggy did not report a tunnel endpoint."
+    [ -f "$PINGGY_LOG_FILE" ] && tail -n 20 "$PINGGY_LOG_FILE"
+    return 1
+}
+
+pinggy_stop() {
+    local pid
+
+    if ! pinggy_is_running; then
+        cecho "33" "pinggy is not running."
+        return 0
+    fi
+
+    pid=$(cat "$PINGGY_PID_FILE" 2>/dev/null || true)
+    kill "$pid" 2>/dev/null || true
+    sleep 1
+
+    if pinggy_is_running; then
+        kill -9 "$pid" 2>/dev/null || true
+    fi
+
+    rm -f "$PINGGY_PID_FILE"
+    cecho "32" "pinggy stopped."
+}
+
+pinggy_status() {
+    local endpoint
+
+    clear
+    line
+    echo "Pinggy status"
+    line
+
+    if command -v ssh >/dev/null 2>&1; then
+        echo "SSH client : installed"
+    else
+        echo "SSH client : missing"
+    fi
+
+    if pinggy_is_running; then
+        echo "State      : running (PID $(cat "$PINGGY_PID_FILE"))"
+    else
+        echo "State      : stopped"
+    fi
+
+    endpoint=$(pinggy_get_endpoint || true)
+    if [ -n "$endpoint" ]; then
+        echo "Tunnel     : $endpoint"
+    else
+        echo "Tunnel     : not detected yet"
+    fi
+
+    if [ -f "$PINGGY_LOG_FILE" ]; then
+        printf '\nRecent log:\n'
+        tail -n 12 "$PINGGY_LOG_FILE" 2>/dev/null || true
+    fi
+}
+
+auto_setup_pinggy() {
+    clear
+    line
+    echo "Auto Pinggy setup"
+    line
+    echo "This mode installs SSH if needed and starts a free TCP tunnel to port 25565."
+    echo "Pinggy does not need an account, but free tunnels are temporary and the address changes after reconnect."
+
+    if ! command -v ssh >/dev/null 2>&1; then
+        echo "Installing OpenSSH..."
+        pkg install -y openssh || true
+    fi
+
+    if ! command -v ssh >/dev/null 2>&1; then
+        cecho "31" "OpenSSH could not be installed."
+        return 1
+    fi
+
+    pinggy_start_background
 }
 
 start_playit_background() {
@@ -1066,22 +1286,29 @@ playit_menu() {
         playit_status
         printf '\n'
         line
-        echo "1. Auto playit setup"
-        echo "2. Browser-assisted Playit key setup"
-        echo "3. Manual playit setup"
-        echo "4. Show playit status"
-        echo "5. Stop playit tunnel"
-        echo "6. Back"
-        printf '\nSelect [1-6]: '
-        read -r choice
+        echo "1. Auto remote setup (Playit, then Pinggy fallback)"
+        echo "2. Auto Pinggy setup"
+        echo "3. Browser-assisted Playit key setup"
+        echo "4. Manual playit setup"
+        echo "5. Show playit status"
+        echo "6. Show Pinggy status"
+        echo "7. Stop remote tunnels"
+        echo "0. Back"
+        printf '\nSelect [1-8, 0, b, q]: '
+        read -r choice || {
+            choice=""
+            continue
+        }
 
         case "$choice" in
             1) auto_setup_playit || true; pause ;;
-            2) auto_playit_site_only || true; pause ;;
-            3) manual_playit_menu ;;
-            4) playit_status || true; pause ;;
-            5) stop_playit || true; pause ;;
-            6) return 0 ;;
+            2) auto_setup_pinggy || true; pause ;;
+            3) auto_playit_site_only || true; pause ;;
+            4) manual_playit_menu ;;
+            5) playit_status || true; pause ;;
+            6) pinggy_status || true; pause ;;
+            7) stop_playit || true; pinggy_stop || true; pause ;;
+            8|0|b|B|back|Back|q|Q|quit|Quit|exit|Exit) return 0 ;;
         esac
     done
 }
@@ -1097,16 +1324,19 @@ manual_playit_menu() {
         echo "2. Link playit account"
         echo "3. Save Playit secret key"
         echo "4. Start playit tunnel"
-        echo "5. Back"
-        printf '\nSelect [1-5]: '
-        read -r choice
+        echo "0. Back"
+        printf '\nSelect [1-5, 0, b, q]: '
+        read -r choice || {
+            choice=""
+            continue
+        }
 
         case "$choice" in
             1) install_playit || true; pause ;;
             2) link_playit ;;
             3) prompt_playit_secret_key || true; pause ;;
             4) start_playit_background || true; pause ;;
-            5) return 0 ;;
+            5|0|b|B|back|Back|q|Q|quit|Quit|exit|Exit) return 0 ;;
         esac
     done
 }
@@ -1184,7 +1414,7 @@ start_server() {
     fi
     show_connection_info
     printf '\nStart the server now? [Y/n]: '
-    read -r answer
+    read -r answer || answer=""
     if [ -z "$answer" ] || [[ "$answer" =~ ^[Yy]$ ]]; then
         printf '\n'
         exec "$START_SCRIPT"
@@ -1202,11 +1432,14 @@ main_menu() {
         echo "3. Start server"
         echo "4. Change RAM"
         echo "5. Open server folder"
-        echo "6. Playit tunnel menu"
+        echo "6. Remote access menu"
         echo "7. Refresh info"
         echo "8. Exit"
         printf '\nSelect [1-8]: '
-        read -r choice
+        read -r choice || {
+            choice=""
+            continue
+        }
 
         case "$choice" in
             1) install_server || true; pause ;;
@@ -1430,7 +1663,7 @@ def main():
     print("   2. Use the menu to install Paper, Vanilla, Fabric, or Bukkit.")
     print("   3. Set RAM inside the menu.")
     print("   4. Add mods/plugins using Modrinth or CurseForge links.")
-    print("   5. Optional: install playit to expose the server outside your LAN.")
+    print("   5. Optional: use the remote access menu for playit or Pinggy to expose the server outside your LAN.")
     print("=" * 64)
 
 
