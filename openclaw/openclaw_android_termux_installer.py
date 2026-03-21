@@ -279,6 +279,14 @@ def write_temp_script(contents):
         return handle.name
 
 
+def open_termux_and_run(device_id, command_text):
+    adb_shell(device_id, "am", "force-stop", TERMUX_PACKAGE, timeout=15000)
+    adb_shell(device_id, "am", "start", "-n", "com.termux/com.termux.app.TermuxActivity", timeout=30000)
+    run_subprocess([ADB, "-s", device_id, "shell", "input", "keyevent", "67"], timeout=30000)
+    run_subprocess([ADB, "-s", device_id, "shell", "input", "text", command_text], timeout=30000)
+    run_subprocess([ADB, "-s", device_id, "shell", "input", "keyevent", "66"], timeout=30000)
+
+
 def process_device(device_id, apk_path, local_debs, setup_script):
     print(f"[{device_id}] Model: {get_device_model(device_id)}")
 
@@ -298,16 +306,9 @@ def process_device(device_id, apk_path, local_debs, setup_script):
 
     push_file(device_id, setup_script, "/data/local/tmp/openclaw-termux-setup.sh")
     adb_shell(device_id, "chmod", "755", "/data/local/tmp/openclaw-termux-setup.sh", timeout=15000)
-    result = termux_exec(device_id, f"{TERMUX_PREFIX}/bin/bash", "/data/local/tmp/openclaw-termux-setup.sh", timeout=1800000)
-    combined = (result.stdout or "") + (result.stderr or "")
-
-    if result.returncode != 0:
-        return f"[{device_id}] FAILED - OpenClaw native npm install failed. Check ~/server/logs/openclaw-install.log"
-
-    if "[OK] OpenClaw files installed" not in combined:
-        return f"[{device_id}] FAILED - OpenClaw install did not reach verification marker"
-
-    return f"[{device_id}] OK - OpenClaw package installed and wrapper written to Termux bin"
+    adb_shell(device_id, "chmod", "755", "/data/local/tmp/openclaw-termux-setup.sh", timeout=15000)
+    open_termux_and_run(device_id, "bash%s/data/local/tmp/openclaw-termux-setup.sh")
+    return f"[{device_id}] OK - Termux opened and OpenClaw install script was launched visibly on the device"
 
 
 def main():
