@@ -119,6 +119,8 @@ load_state() {
         # shellcheck disable=SC1090
         . "$STATE_FILE"
     fi
+
+    sync_state_with_installation
 }
 
 save_state() {
@@ -128,6 +130,71 @@ MC_VERSION="$MC_VERSION"
 RAM_GB="$RAM_GB"
 SERVER_JAR="$SERVER_JAR"
 EOF
+}
+
+sync_state_with_installation() {
+    local detected_type detected_version detected_ram detected_jar detected_max_mb found_install state_changed first_jar
+    found_install=0
+    state_changed=0
+
+    if [ -f "$START_SCRIPT" ]; then
+        detected_jar=$(sed -n 's/^SERVER_JAR="\([^"]*\)"$/\1/p' "$START_SCRIPT" | head -n1)
+        detected_type=$(sed -n 's/^echo "Starting \([^ ]*\) .*$/\1/p' "$START_SCRIPT" | head -n1)
+        detected_version=$(sed -n 's/^echo "Starting [^ ]* \([^ ]*\) with -Xms.*$/\1/p' "$START_SCRIPT" | head -n1)
+        detected_max_mb=$(sed -n 's/^MAX_MB="\([0-9][0-9]*\)"$/\1/p' "$START_SCRIPT" | head -n1)
+
+        [ -z "$detected_jar" ] && detected_jar="server.jar"
+
+        if [ -f "$SERVER_DIR/$detected_jar" ]; then
+            found_install=1
+            if [ -n "$detected_max_mb" ] && [ $((detected_max_mb % 1024)) -eq 0 ]; then
+                detected_ram=$((detected_max_mb / 1024))
+            fi
+        fi
+    fi
+
+    if [ "$found_install" -eq 0 ]; then
+        first_jar=$(find "$SERVER_DIR" -maxdepth 1 -type f -name '*.jar' | head -n1)
+        if [ -n "$first_jar" ]; then
+            found_install=1
+            detected_jar=$(basename "$first_jar")
+            if [ -d "$SERVER_DIR/mods" ]; then
+                detected_type="fabric"
+            elif [ -d "$SERVER_DIR/plugins" ]; then
+                detected_type="paper"
+            fi
+        fi
+    fi
+
+    if [ "$found_install" -eq 1 ]; then
+        if [ -n "$detected_type" ] && [ "$SERVER_TYPE" != "$detected_type" ]; then
+            SERVER_TYPE="$detected_type"
+            state_changed=1
+        fi
+        if [ -n "$detected_version" ] && [ "$MC_VERSION" != "$detected_version" ]; then
+            MC_VERSION="$detected_version"
+            state_changed=1
+        fi
+        if [ -n "$detected_ram" ] && [ "$RAM_GB" != "$detected_ram" ]; then
+            RAM_GB="$detected_ram"
+            state_changed=1
+        fi
+        if [ -n "$detected_jar" ] && [ "$SERVER_JAR" != "$detected_jar" ]; then
+            SERVER_JAR="$detected_jar"
+            state_changed=1
+        fi
+    else
+        if [ -n "$SERVER_TYPE" ] || [ -n "$MC_VERSION" ] || [ "$SERVER_JAR" != "server.jar" ]; then
+            SERVER_TYPE=""
+            MC_VERSION=""
+            SERVER_JAR="server.jar"
+            state_changed=1
+        fi
+    fi
+
+    if [ "$state_changed" -eq 1 ]; then
+        save_state
+    fi
 }
 
 get_device_ip() {
@@ -144,7 +211,7 @@ get_device_ip() {
 
 show_connection_info() {
     load_state
-    local ip_addr playit_endpoint pinggy_endpoint
+    local ip_addr playit_endpoint pinggy_endpoint remote_auto_status
     ip_addr=$(get_device_ip)
     clear
     line
@@ -156,6 +223,14 @@ show_connection_info() {
     echo "IP          : ${ip_addr}"
     echo "Port        : 25565"
     echo "LAN join    : ${ip_addr}:25565"
+    if playit_has_secret || [ -f "$PLAYIT_CONFIG_FILE" ]; then
+        remote_auto_status="playit"
+    elif [ -f "$PINGGY_LOG_FILE" ] || pinggy_is_running; then
+        remote_auto_status="pinggy"
+    else
+        remote_auto_status="off"
+    fi
+    echo "Remote auto : ${remote_auto_status}"
     playit_endpoint=$(playit_get_endpoint || true)
     if [ -n "$playit_endpoint" ]; then
         echo "playit      : $playit_endpoint"
@@ -213,16 +288,61 @@ prompt_server_type() {
 }
 
 get_latest_release_version() {
-    curl -fsSL "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json" | jq -r '.latest.release'
+    fetch_minecraft_version_manifest | jq -r '.latest.release // empty'
+}
+
+fetch_minecraft_version_manifest() {
+    local manifest_url
+
+    for manifest_url in \
+        "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json" \
+        "https://launchermeta.mojang.com/mc/game/version_manifest_v2.json"
+    do
+        if curl -fsSL "$manifest_url"; then
+            return 0
+        fi
+    done
+
+    cecho "31" "Could not download the Minecraft version manifest from Mojang."
+    return 1
+}
+
+paper_has_stable_build() {
+    local version="$1"
+    local builds_json
+
+    builds_json=$(curl -fsSL -H "User-Agent: $USER_AGENT" "https://fill.papermc.io/v3/projects/paper/versions/${version}/builds" 2>/dev/null) || return 1
+    printf '%s' "$builds_json" | jq -e 'any(.[]?; .channel == "STABLE" and .downloads."server:default".url != null)' >/dev/null 2>&1
+}
+
+get_latest_paper_version() {
+    local versions_json version
+    versions_json=$(curl -fsSL -H "User-Agent: $USER_AGENT" "https://fill.papermc.io/v3/projects/paper" 2>/dev/null) || return 1
+
+    while IFS= read -r version; do
+        [ -z "$version" ] && continue
+        if paper_has_stable_build "$version"; then
+            printf '%s' "$version"
+            return 0
+        fi
+    done < <(printf '%s' "$versions_json" | jq -r '[.versions[][] | select(test("^[0-9]+\\.[0-9]+(\\.[0-9]+)?$"))] | unique | sort_by(split(".") | map(tonumber)) | reverse[]')
+
+    return 1
 }
 
 prompt_minecraft_version() {
-    local latest_version
-    latest_version=$(get_latest_release_version)
-    printf '\nMinecraft version [latest=%s, press ENTER for latest]: ' "$latest_version"
+    local latest_version prompt_default
+    if [ "$SERVER_TYPE" = "paper" ]; then
+        latest_version=$(get_latest_paper_version || true)
+    fi
+    if [ -z "$latest_version" ]; then
+        latest_version=$(get_latest_release_version || true)
+    fi
+    prompt_default="${latest_version:-${MC_VERSION:-1.21.4}}"
+    printf '\nMinecraft version [latest=%s, press ENTER for latest]: ' "$prompt_default"
     read -r requested_version || requested_version=""
     if [ -z "$requested_version" ]; then
-        MC_VERSION="$latest_version"
+        MC_VERSION="$prompt_default"
     else
         MC_VERSION="$requested_version"
     fi
@@ -280,6 +400,20 @@ EOF
     chmod +x "$START_SCRIPT"
 }
 
+verify_server_jar() {
+    local jar_path="$1"
+
+    if [ ! -f "$jar_path" ]; then
+        cecho "31" "Server jar is missing: $jar_path"
+        return 1
+    fi
+
+    if ! unzip -tq "$jar_path" >/dev/null 2>&1; then
+        cecho "31" "Downloaded server jar is invalid or incomplete."
+        return 1
+    fi
+}
+
 apply_mobile_tuning() {
     if [ -f "$SERVER_DIR/server.properties" ]; then
         sed -i 's/^view-distance=.*/view-distance=6/' "$SERVER_DIR/server.properties" 2>/dev/null || true
@@ -301,16 +435,26 @@ accept_eula() {
 }
 
 install_paper() {
-    local builds_json download_url
+    local builds_json download_url build_channel
     SERVER_JAR="server.jar"
 
     cecho "36" "Installing Paper ${MC_VERSION}"
     builds_json=$(curl -fsSL -H "User-Agent: $USER_AGENT" "https://fill.papermc.io/v3/projects/paper/versions/${MC_VERSION}/builds")
-    download_url=$(printf '%s' "$builds_json" | jq -r 'first(.[] | select(.channel == "STABLE") | .downloads."server:default".url) // empty')
+    download_url=$(printf '%s' "$builds_json" | jq -r 'sort_by(.id) | reverse | first(.[] | select(.channel == "STABLE") | .downloads."server:default".url) // empty')
+    build_channel="STABLE"
 
     if [ -z "$download_url" ]; then
-        cecho "31" "No stable Paper build found for ${MC_VERSION}."
+        download_url=$(printf '%s' "$builds_json" | jq -r 'sort_by(.id) | reverse | first(.[] | .downloads."server:default".url) // empty')
+        build_channel=$(printf '%s' "$builds_json" | jq -r 'sort_by(.id) | reverse | first(.[] | .channel) // empty')
+    fi
+
+    if [ -z "$download_url" ]; then
+        cecho "31" "No Paper build found for ${MC_VERSION}."
         return 1
+    fi
+
+    if [ "$build_channel" != "STABLE" ]; then
+        cecho "33" "No stable Paper build found for ${MC_VERSION}; using latest ${build_channel} build instead."
     fi
 
     rm -f "$SERVER_DIR/$SERVER_JAR"
@@ -322,7 +466,7 @@ install_vanilla() {
     SERVER_JAR="server.jar"
 
     cecho "36" "Installing Vanilla ${MC_VERSION}"
-    manifest_json=$(curl -fsSL "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json")
+    manifest_json=$(fetch_minecraft_version_manifest) || return 1
     version_json_url=$(printf '%s' "$manifest_json" | jq -r --arg version "$MC_VERSION" '.versions[] | select(.id == $version) | .url' | head -n1)
 
     if [ -z "$version_json_url" ]; then
@@ -384,23 +528,61 @@ install_bukkit() {
 }
 
 install_server() {
+    local live_server_dir temp_server_dir backup_server_dir install_ok
     ensure_packages
     prompt_server_type
     prompt_minecraft_version
     prompt_ram "$RAM_GB"
 
-    rm -rf "$SERVER_DIR"
-    mkdir -p "$SERVER_DIR"
+    live_server_dir="$BASE_DIR/server"
+    temp_server_dir="$BASE_DIR/server.installing"
+    backup_server_dir="$BASE_DIR/server.backup"
+    install_ok=0
+
+    rm -rf "$temp_server_dir" "$backup_server_dir"
+    mkdir -p "$temp_server_dir"
+    SERVER_DIR="$temp_server_dir"
 
     case "$SERVER_TYPE" in
-        paper) install_paper ;;
-        vanilla) install_vanilla ;;
-        fabric) install_fabric ;;
-        bukkit) install_bukkit ;;
-        *) cecho "31" "Unsupported server type: $SERVER_TYPE"; return 1 ;;
+        paper) install_paper || true ;;
+        vanilla) install_vanilla || true ;;
+        fabric) install_fabric || true ;;
+        bukkit) install_bukkit || true ;;
+        *)
+            cecho "31" "Unsupported server type: $SERVER_TYPE"
+            SERVER_DIR="$live_server_dir"
+            rm -rf "$temp_server_dir"
+            return 1
+            ;;
     esac
 
-    accept_eula
+    if verify_server_jar "$SERVER_DIR/$SERVER_JAR" && accept_eula; then
+        install_ok=1
+    fi
+
+    if [ "$install_ok" -ne 1 ]; then
+        SERVER_DIR="$live_server_dir"
+        rm -rf "$temp_server_dir"
+        cecho "31" "Server installation failed."
+        return 1
+    fi
+
+    if [ -d "$live_server_dir" ]; then
+        mv "$live_server_dir" "$backup_server_dir"
+    fi
+    if ! mv "$temp_server_dir" "$live_server_dir"; then
+        SERVER_DIR="$live_server_dir"
+        rm -rf "$temp_server_dir"
+        if [ -d "$backup_server_dir" ]; then
+            mv "$backup_server_dir" "$live_server_dir" 2>/dev/null || true
+        fi
+        cecho "31" "Could not finalize server installation."
+        return 1
+    fi
+
+    SERVER_DIR="$live_server_dir"
+    rm -rf "$backup_server_dir"
+
     write_start_script
     save_state
 
@@ -1293,8 +1475,8 @@ playit_menu() {
         echo "5. Show playit status"
         echo "6. Show Pinggy status"
         echo "7. Stop remote tunnels"
-        echo "0. Back"
-        printf '\nSelect [1-8, 0, b, q]: '
+        echo "8. Back"
+        printf '\nSelect [1-8, b, q]: '
         read -r choice || {
             choice=""
             continue
@@ -1406,6 +1588,33 @@ change_ram() {
     cecho "32" "RAM updated to ${RAM_GB} GB"
 }
 
+auto_start_remote_tunnel() {
+    if playit_is_running || pinggy_is_running; then
+        cecho "32" "Remote tunnel already running."
+        return 0
+    fi
+
+    if playit_has_secret || [ -f "$PLAYIT_CONFIG_FILE" ]; then
+        cecho "36" "Auto-starting remote tunnel with playit..."
+        playit_ensure_tunnel 25565 tcp || true
+        if start_playit_background; then
+            return 0
+        fi
+        cecho "33" "playit auto-start failed."
+    fi
+
+    if [ -f "$PINGGY_LOG_FILE" ]; then
+        cecho "36" "Auto-starting remote tunnel with Pinggy..."
+        if pinggy_start_background; then
+            return 0
+        fi
+        cecho "33" "Pinggy auto-start failed."
+    fi
+
+    cecho "33" "No remote tunnel configured for auto-start."
+    return 0
+}
+
 start_server() {
     load_state
     if [ ! -x "$START_SCRIPT" ]; then
@@ -1417,6 +1626,7 @@ start_server() {
     read -r answer || answer=""
     if [ -z "$answer" ] || [[ "$answer" =~ ^[Yy]$ ]]; then
         printf '\n'
+        auto_start_remote_tunnel || true
         exec "$START_SCRIPT"
     fi
 }
@@ -1429,7 +1639,7 @@ main_menu() {
         line
         echo "1. Install or reinstall server"
         echo "2. Install mods/plugins"
-        echo "3. Start server"
+        echo "3. Start server + auto tunnel"
         echo "4. Change RAM"
         echo "5. Open server folder"
         echo "6. Remote access menu"
