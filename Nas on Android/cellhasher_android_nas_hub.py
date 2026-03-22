@@ -74,7 +74,11 @@ NPM_PREFIX="$HOME/.npm-global"
 LT_BIN="$NPM_PREFIX/bin/lt"
 SERVER_URL=""
 
-mkdir -p "$BASE_DIR" "$BIN_DIR" "$ETC_DIR" "$DATA_DIR" "$LOG_DIR" "$STATE_DIR" "$TMP_DIR"
+ensure_base_dirs() {
+    mkdir -p "$BASE_DIR" "$BIN_DIR" "$ETC_DIR" "$DATA_DIR" "$LOG_DIR" "$STATE_DIR" "$TMP_DIR"
+}
+
+ensure_base_dirs
 
 cecho() {
     local color="$1"
@@ -111,6 +115,7 @@ yaml_value() {
 }
 
 load_runtime() {
+    ensure_base_dirs
     NAS_PORT="8080"
     NAS_BIND="0.0.0.0"
     NAS_ROOT="$DATA_DIR/storage"
@@ -139,7 +144,7 @@ load_runtime() {
 }
 
 save_runtime() {
-    mkdir -p "$ETC_DIR"
+    ensure_base_dirs
     cat > "$RUNTIME_ENV" <<EOF
 NAS_PORT='$(safe_value "$NAS_PORT")'
 NAS_BIND='$(safe_value "$NAS_BIND")'
@@ -331,6 +336,7 @@ show_info_screen() {
 }
 
 ensure_base_packages() {
+    ensure_base_dirs
     {
         echo "[$(date '+%F %T')] Updating Termux packages"
         pkg update -y || true
@@ -373,20 +379,26 @@ install_dufs() {
         *) cecho "31" "Unsupported device architecture for webdav: $(uname -m)"; return 1 ;;
     esac
     echo "[2/4] Fetching webdav release metadata..."
-    release_json=$(curl -fsSL "https://api.github.com/repos/hacdias/webdav/releases/latest") || { cecho "31" "Could not fetch webdav release metadata."; return 1; }
-    version=$(printf '%s' "$release_json" | jq -r '.tag_name // empty' | sed 's/^v//')
+    release_json=$(curl -fsSL --connect-timeout 20 --max-time 60 --retry 2 "https://api.github.com/repos/hacdias/webdav/releases/latest" 2>> "$INSTALL_LOG_FILE") || true
+    version=$(printf '%s' "$release_json" | jq -r '.tag_name // empty' 2>/dev/null | sed 's/^v//')
+    [ -z "$version" ] && version="latest"
     archive_path="$TMP_DIR/webdav.tar.gz"
     extract_dir="$TMP_DIR/webdav-extract"
     rm -rf "$extract_dir"
     mkdir -p "$extract_dir"
     echo "[3/4] Downloading webdav $version..."
-    curl -fL "$download_url" -o "$archive_path" >> "$INSTALL_LOG_FILE" 2>&1 || { cecho "31" "Failed to download webdav."; return 1; }
+    echo "This can take a minute on mobile data or slow Wi-Fi."
+    curl --progress-bar -fL --connect-timeout 20 --max-time 300 --retry 3 --retry-delay 2 "$download_url" -o "$archive_path" 2>> "$INSTALL_LOG_FILE" || { cecho "31" "Failed to download webdav."; return 1; }
     echo "[4/4] Unpacking and installing webdav..."
     tar -xzf "$archive_path" -C "$extract_dir" >> "$INSTALL_LOG_FILE" 2>&1 || { cecho "31" "Failed to unpack webdav."; return 1; }
     webdav_path=$(find "$extract_dir" -type f -name webdav | head -n1)
     if [ -z "$webdav_path" ]; then cecho "31" "webdav binary was not found after unpacking."; return 1; fi
     cp "$webdav_path" "$DUFS_BIN"
     chmod 755 "$DUFS_BIN"
+    if ! "$DUFS_BIN" version >/dev/null 2>&1; then
+        cecho "31" "webdav installed but does not run on this device."
+        return 1
+    fi
     DUFS_VERSION="$version"
     save_runtime
     cecho "32" "webdav $version installed."
