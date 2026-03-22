@@ -128,6 +128,7 @@ load_runtime() {
     TUNNEL_LOCAL_HOST="127.0.0.1"
     TUNNEL_SUBDOMAIN=""
     TUNNEL_URL=""
+    LAST_LAN_IP=""
     DUFS_VERSION=""
     LAST_INSTALL_AT=""
     ADMIN_USER="admin"
@@ -158,6 +159,7 @@ TUNNEL_HOST='$(safe_value "$TUNNEL_HOST")'
 TUNNEL_LOCAL_HOST='$(safe_value "$TUNNEL_LOCAL_HOST")'
 TUNNEL_SUBDOMAIN='$(safe_value "$TUNNEL_SUBDOMAIN")'
 TUNNEL_URL='$(safe_value "$TUNNEL_URL")'
+LAST_LAN_IP='$(safe_value "$LAST_LAN_IP")'
 DUFS_VERSION='$(safe_value "$DUFS_VERSION")'
 LAST_INSTALL_AT='$(safe_value "$LAST_INSTALL_AT")'
 ADMIN_USER='$(safe_value "$ADMIN_USER")'
@@ -184,6 +186,10 @@ validate_simple_token() {
     printf "%s" "$1" | grep -Eq '^[A-Za-z0-9._@-]{1,32}$'
 }
 
+valid_tunnel_url() {
+    printf '%s' "$1" | grep -Eq '^https://[^[:space:]]+$'
+}
+
 get_device_ip() {
     local ip_addr iface
 
@@ -202,6 +208,18 @@ get_device_ip() {
     done
 
     ip_addr=$(ip -4 addr show up scope global 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 | grep -Ev '^127\.' | head -n1)
+    if [ -n "$ip_addr" ]; then
+        printf '%s' "$ip_addr"
+        return 0
+    fi
+
+    ip_addr=$(getprop dhcp.wlan0.ipaddress 2>/dev/null | tr -d '\r')
+    if [ -n "$ip_addr" ]; then
+        printf '%s' "$ip_addr"
+        return 0
+    fi
+
+    ip_addr=$(getprop dhcp.eth0.ipaddress 2>/dev/null | tr -d '\r')
     if [ -n "$ip_addr" ]; then
         printf '%s' "$ip_addr"
         return 0
@@ -292,11 +310,20 @@ dashboard_header() {
     load_runtime
     local ip_addr install_state run_state tunnel_state tunnel_url
     ip_addr=$(get_device_ip)
+    if [ "$ip_addr" != "Unknown" ]; then
+        LAST_LAN_IP="$ip_addr"
+    else
+        ip_addr="$LAST_LAN_IP"
+    fi
     install_state=$(nas_install_state)
     if nas_is_running; then run_state="running"; else run_state="stopped"; fi
     if tunnel_is_running; then tunnel_state="running"; else tunnel_state="stopped"; fi
     tunnel_url=$(extract_tunnel_url || true)
-    [ -n "$tunnel_url" ] && TUNNEL_URL="$tunnel_url"
+    if valid_tunnel_url "$tunnel_url"; then
+        TUNNEL_URL="$tunnel_url"
+    elif ! valid_tunnel_url "$TUNNEL_URL"; then
+        TUNNEL_URL=""
+    fi
     save_runtime
     clear
     line
@@ -305,9 +332,13 @@ dashboard_header() {
     echo "NAS state    : $install_state / $run_state"
     echo "NAS root     : $NAS_ROOT"
     echo "WebDAV port  : $NAS_PORT"
-    echo "LAN address  : http://$ip_addr:$NAS_PORT"
+    if [ -z "$ip_addr" ] || [ "$ip_addr" = "Unknown" ]; then
+        echo "LAN address  : unavailable"
+    else
+        echo "LAN address  : http://$ip_addr:$NAS_PORT"
+    fi
     echo "Tunnel       : $tunnel_state"
-    if [ -n "$TUNNEL_URL" ]; then echo "Tunnel URL   : $TUNNEL_URL"; else echo "Tunnel URL   : not assigned"; fi
+    if valid_tunnel_url "$TUNNEL_URL"; then echo "Tunnel URL   : $TUNNEL_URL"; else echo "Tunnel URL   : not assigned"; fi
     echo "External     : ${EXTERNAL_MODE}${EXTERNAL_PATH:+ -> $EXTERNAL_PATH}${RCLONE_REMOTE:+ -> $RCLONE_REMOTE}"
     echo "Users        : $ADMIN_USER, $UPLOADER_USER, $VIEWER_USER"
     echo "Last install : ${LAST_INSTALL_AT:-never}"
@@ -518,7 +549,19 @@ start_nas() {
     sleep 3
     if nas_is_running; then
         cecho "32" "NAS started."
-        cecho "32" "LAN URL: http://$(get_device_ip):$NAS_PORT/"
+        local ip_addr
+        ip_addr=$(get_device_ip)
+        if [ "$ip_addr" != "Unknown" ]; then
+            LAST_LAN_IP="$ip_addr"
+            save_runtime
+        else
+            ip_addr="$LAST_LAN_IP"
+        fi
+        if [ -z "$ip_addr" ] || [ "$ip_addr" = "Unknown" ]; then
+            cecho "33" "LAN URL could not be detected automatically on this device."
+        else
+            cecho "32" "LAN URL: http://$ip_addr:$NAS_PORT/"
+        fi
     else
         cecho "31" "NAS failed to stay running."
         if [ -f "$DUFS_LOG_FILE" ]; then
@@ -670,7 +713,11 @@ start_tunnel() {
     echo "cloudflared" > "$TUNNEL_TOOL_FILE"
     sleep 8
     TUNNEL_URL=$(extract_tunnel_url || true)
-    [ -n "$TUNNEL_URL" ] && printf '%s\n' "$TUNNEL_URL" > "$TUNNEL_STATUS_FILE"
+    if valid_tunnel_url "$TUNNEL_URL"; then
+        printf '%s\n' "$TUNNEL_URL" > "$TUNNEL_STATUS_FILE"
+    else
+        TUNNEL_URL=""
+    fi
     save_runtime
     echo "${TUNNEL_URL:-Tunnel started; check logs.}"
 }
