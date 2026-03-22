@@ -270,7 +270,6 @@ extract_tunnel_url() {
 
 dashboard_header() {
     load_runtime
-    ensure_storage_layout
     local ip_addr install_state run_state tunnel_state tunnel_url
     ip_addr=$(get_device_ip)
     install_state=$(nas_install_state)
@@ -340,6 +339,31 @@ ensure_base_packages() {
         pkg install -y curl jq tar gzip unzip procps psmisc rsync nodejs rclone termux-tools
         echo "[$(date '+%F %T')] Package step finished"
     } >> "$INSTALL_LOG_FILE" 2>&1
+}
+
+ensure_termux_storage_access() {
+    if [ -d "$HOME/storage/shared" ]; then
+        echo "Termux shared storage already available."
+        return 0
+    fi
+
+    echo "Requesting Termux shared-storage setup..."
+    echo "If Android shows a permission dialog, keep Termux open and tap Allow."
+    termux-setup-storage >/dev/null 2>&1 &
+
+    local wait_seconds
+    for wait_seconds in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+        if [ -d "$HOME/storage/shared" ]; then
+            echo "Shared storage permission granted."
+            return 0
+        fi
+        sleep 1
+    done
+
+    echo "Shared storage is still unavailable."
+    echo "Continuing with app-private NAS storage only."
+    echo "You can grant storage later in Termux by running: termux-setup-storage"
+    return 1
 }
 
 install_dufs() {
@@ -424,9 +448,7 @@ install_or_reinstall_nas() {
         [ -f "$INSTALL_LOG_FILE" ] && tail -n 40 "$INSTALL_LOG_FILE"
         return 1
     fi
-    echo "Requesting Termux shared-storage setup..."
-    termux-setup-storage >/dev/null 2>&1 || true
-    sleep 2
+    ensure_termux_storage_access || true
     if nas_is_running; then stop_nas >/dev/null 2>&1; fi
     install_dufs || {
         [ -f "$INSTALL_LOG_FILE" ] && tail -n 40 "$INSTALL_LOG_FILE"
@@ -496,6 +518,28 @@ restart_nas() {
     stop_nas || true
     start_nas
 }
+
+uninstall_nas() {
+    load_runtime
+    dashboard_header
+    printf '\nThis removes the NAS files in %s\n' "$BASE_DIR"
+    printf 'Installed Termux packages are kept.\n'
+    printf 'Continue uninstall? [y/N]: '
+    read -r answer || answer=""
+    if ! printf '%s' "$answer" | grep -Eq '^[Yy]$'; then
+        echo "Uninstall cancelled."
+        return 0
+    fi
+
+    stop_tunnel >/dev/null 2>&1 || true
+    stop_nas >/dev/null 2>&1 || true
+    rm -rf "$BASE_DIR"
+    TUNNEL_URL=""
+    LAST_INSTALL_AT=""
+    save_runtime
+    cecho "32" "NAS uninstalled."
+}
+
 show_runtime_config() {
     load_runtime
     dashboard_header
@@ -728,25 +772,25 @@ external_datakeepers_menu() {
 
 main_menu() {
     load_runtime
-    ensure_storage_layout
     while true; do
         dashboard_header
-        printf '\n1. Install or reinstall NAS\n2. Start NAS\n3. Stop NAS\n4. Restart NAS\n5. Show status\n6. Show info\n7. Config menu\n8. Users menu\n9. Tunnel menu\n10. External datakeepers\n11. Logs\n12. Refresh\n13. Exit\n\nSelect [1-13]: '
+        printf '\n1. Install or reinstall NAS\n2. Start NAS\n3. Stop NAS\n4. Restart NAS\n5. Uninstall NAS\n6. Show status\n7. Show info\n8. Config menu\n9. Users menu\n10. Tunnel menu\n11. External datakeepers\n12. Logs\n13. Refresh\n14. Exit\n\nSelect [1-14]: '
         read -r choice || choice=""
         case "$choice" in
             1) install_or_reinstall_nas; pause ;;
             2) start_nas; pause ;;
             3) stop_nas; pause ;;
             4) restart_nas; pause ;;
-            5) show_status_screen; pause ;;
-            6) show_info_screen; pause ;;
-            7) config_menu ;;
-            8) users_menu ;;
-            9) tunnel_menu ;;
-            10) external_datakeepers_menu ;;
-            11) logs_menu ;;
-            12) ;;
-            13|0|q|Q|exit|Exit|quit|Quit) exit 0 ;;
+            5) uninstall_nas; pause ;;
+            6) show_status_screen; pause ;;
+            7) show_info_screen; pause ;;
+            8) config_menu ;;
+            9) users_menu ;;
+            10) tunnel_menu ;;
+            11) external_datakeepers_menu ;;
+            12) logs_menu ;;
+            13) ;;
+            14|0|q|Q|exit|Exit|quit|Quit) exit 0 ;;
         esac
     done
 }
