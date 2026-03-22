@@ -143,6 +143,8 @@ chmod 755 "$HOME/server/bin/start_openclaw.sh"
 python "$HOME/server/scripts/test.py" 2>&1 | tee -a "$LOG_FILE"
 log "[OK] OpenClaw files installed"
 log "[OK] Wrapper written to $PREFIX/bin/openclaw"
+log "[INFO] Launching OpenClaw onboarding"
+exec openclaw onboard
 '''
 
 
@@ -308,7 +310,7 @@ def process_device(device_id, apk_path, local_debs, setup_script):
     adb_shell(device_id, "chmod", "755", "/data/local/tmp/openclaw-termux-setup.sh", timeout=15000)
     adb_shell(device_id, "chmod", "755", "/data/local/tmp/openclaw-termux-setup.sh", timeout=15000)
     open_termux_and_run(device_id, "bash%s/data/local/tmp/openclaw-termux-setup.sh")
-    return f"[{device_id}] OK - Termux opened and OpenClaw install script was launched visibly on the device"
+    return f"[{device_id}] OK - Termux opened and the OpenClaw install/onboard flow was launched visibly on the device"
 
 
 def main():
@@ -374,7 +376,7 @@ def main():
     for line in results:
         print(line)
     print()
-    print("If install succeeds, next on the phone: run `openclaw onboard` inside Termux.")
+    print("If install succeeds, complete the visible `openclaw onboard` flow in Termux, then use `openclaw gateway`.")
 
 
 if __name__ == "__main__":

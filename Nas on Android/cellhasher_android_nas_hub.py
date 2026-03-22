@@ -70,6 +70,7 @@ TUNNEL_PID_FILE="$STATE_DIR/tunnel.pid"
 TUNNEL_LOG_FILE="$LOG_DIR/tunnel.log"
 TUNNEL_STATUS_FILE="$STATE_DIR/tunnel.status"
 TUNNEL_TOOL_FILE="$STATE_DIR/tunnel.tool"
+CF_BIN="/data/data/com.termux/files/usr/bin/cloudflared"
 NPM_PREFIX="$HOME/.npm-global"
 LT_BIN="$NPM_PREFIX/bin/lt"
 SERVER_URL=""
@@ -122,8 +123,8 @@ load_runtime() {
     EXTERNAL_MODE="none"
     EXTERNAL_PATH=""
     RCLONE_REMOTE=""
-    TUNNEL_PROVIDER="localtunnel"
-    TUNNEL_HOST="https://localtunnel.app"
+    TUNNEL_PROVIDER="cloudflared"
+    TUNNEL_HOST=""
     TUNNEL_LOCAL_HOST="127.0.0.1"
     TUNNEL_SUBDOMAIN=""
     TUNNEL_URL=""
@@ -184,15 +185,29 @@ validate_simple_token() {
 }
 
 get_device_ip() {
-    local ip_addr
-    ip_addr=$(ip addr show wlan0 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 | head -n1)
-    if [ -z "$ip_addr" ]; then
-        ip_addr=$(ip route 2>/dev/null | awk '/src/ {print $NF}' | head -n1)
+    local ip_addr iface
+
+    ip_addr=$(ip route get 1.1.1.1 2>/dev/null | awk '/src/ {for (i=1; i<=NF; i++) if ($i == "src") { print $(i+1); exit }}')
+    if [ -n "$ip_addr" ]; then
+        printf '%s' "$ip_addr"
+        return 0
     fi
-    if [ -z "$ip_addr" ]; then
-        ip_addr="Unknown"
+
+    for iface in wlan0 wifi0 eth0 rmnet_data0 rmnet0; do
+        ip_addr=$(ip -4 addr show "$iface" 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 | head -n1)
+        if [ -n "$ip_addr" ]; then
+            printf '%s' "$ip_addr"
+            return 0
+        fi
+    done
+
+    ip_addr=$(ip -4 addr show up scope global 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 | grep -Ev '^127\.' | head -n1)
+    if [ -n "$ip_addr" ]; then
+        printf '%s' "$ip_addr"
+        return 0
     fi
-    printf '%s' "$ip_addr"
+
+    printf '%s' "Unknown"
 }
 
 nas_binary_installed() {
@@ -265,11 +280,11 @@ tunnel_is_running() {
 
 extract_tunnel_url() {
     if [ -f "$TUNNEL_STATUS_FILE" ]; then
-        grep -Eo 'https://[^[:space:]]+' "$TUNNEL_STATUS_FILE" | tail -n1
+        grep -Eo 'https://[^[:space:]]+' "$TUNNEL_STATUS_FILE" | grep -E 'trycloudflare\.com|loca\.lt|localtunnel' | tail -n1
         return
     fi
     if [ -f "$TUNNEL_LOG_FILE" ]; then
-        grep -Eo 'https://[^[:space:]]+' "$TUNNEL_LOG_FILE" | tail -n1
+        grep -Eo 'https://[^[:space:]]+' "$TUNNEL_LOG_FILE" | grep -E 'trycloudflare\.com|loca\.lt|localtunnel' | tail -n1
     fi
 }
 
@@ -640,25 +655,29 @@ show_user_folders() { dashboard_header; printf '\n'; printf '%s\n' "$NAS_ROOT/sh
 
 configure_npm_prefix() { mkdir -p "$NPM_PREFIX/bin"; export PATH="$NPM_PREFIX/bin:$PATH"; npm config set prefix "$NPM_PREFIX" >/dev/null 2>&1 || true; }
 ensure_localtunnel() { configure_npm_prefix; [ -x "$LT_BIN" ] || npm install -g localtunnel >> "$INSTALL_LOG_FILE" 2>&1; [ -x "$LT_BIN" ]; }
+ensure_cloudflared() { command -v cloudflared >/dev/null 2>&1 || pkg install -y cloudflared >> "$INSTALL_LOG_FILE" 2>&1; command -v cloudflared >/dev/null 2>&1; }
 
 show_tunnel_status() { dashboard_header; printf '\n'; if tunnel_is_running; then echo "Tunnel: running"; else echo "Tunnel: stopped"; fi; extract_tunnel_url || true; }
 
 start_tunnel() {
     load_runtime
     if ! nas_is_running; then echo "Start the NAS first."; return 1; fi
-    ensure_localtunnel || { echo "localtunnel install failed."; return 1; }
-    nohup sh -c "\"$LT_BIN\" --port \"$NAS_PORT\" --local-host \"$TUNNEL_LOCAL_HOST\" --host \"$TUNNEL_HOST\" ${TUNNEL_SUBDOMAIN:+--subdomain \"$TUNNEL_SUBDOMAIN\"}" > "$TUNNEL_LOG_FILE" 2>&1 &
+    ensure_cloudflared || { echo "cloudflared install failed."; return 1; }
+    : > "$TUNNEL_LOG_FILE"
+    : > "$TUNNEL_STATUS_FILE"
+    nohup sh -c "cloudflared tunnel --url \"http://$TUNNEL_LOCAL_HOST:$NAS_PORT\" --no-autoupdate" > "$TUNNEL_LOG_FILE" 2>&1 &
     echo $! > "$TUNNEL_PID_FILE"
-    echo "localtunnel" > "$TUNNEL_TOOL_FILE"
-    sleep 5
+    echo "cloudflared" > "$TUNNEL_TOOL_FILE"
+    sleep 8
     TUNNEL_URL=$(extract_tunnel_url || true)
+    [ -n "$TUNNEL_URL" ] && printf '%s\n' "$TUNNEL_URL" > "$TUNNEL_STATUS_FILE"
     save_runtime
     echo "${TUNNEL_URL:-Tunnel started; check logs.}"
 }
 
 stop_tunnel() { if tunnel_is_running; then kill "$(cat "$TUNNEL_PID_FILE")" 2>/dev/null || true; rm -f "$TUNNEL_PID_FILE"; fi; TUNNEL_URL=""; save_runtime; echo "Tunnel stopped."; }
-show_tunnel_config() { dashboard_header; printf '\n'; echo "TUNNEL_HOST=$TUNNEL_HOST"; echo "TUNNEL_LOCAL_HOST=$TUNNEL_LOCAL_HOST"; echo "TUNNEL_SUBDOMAIN=$TUNNEL_SUBDOMAIN"; echo "TUNNEL_URL=$TUNNEL_URL"; }
-edit_tunnel_settings() { dashboard_header; printf '\nHost [%s]: ' "$TUNNEL_HOST"; read -r v || v=""; [ -n "$v" ] && TUNNEL_HOST="$v"; printf 'Local host [%s]: ' "$TUNNEL_LOCAL_HOST"; read -r v || v=""; [ -n "$v" ] && TUNNEL_LOCAL_HOST="$v"; printf 'Subdomain [%s]: ' "$TUNNEL_SUBDOMAIN"; read -r v || v=""; TUNNEL_SUBDOMAIN="$v"; save_runtime; echo "Tunnel settings saved."; }
+show_tunnel_config() { dashboard_header; printf '\n'; echo "TUNNEL_PROVIDER=$TUNNEL_PROVIDER"; echo "TUNNEL_LOCAL_HOST=$TUNNEL_LOCAL_HOST"; echo "TUNNEL_URL=$TUNNEL_URL"; echo "TUNNEL_HOST=${TUNNEL_HOST:-auto}"; echo "TUNNEL_SUBDOMAIN=${TUNNEL_SUBDOMAIN:-auto}"; }
+edit_tunnel_settings() { dashboard_header; printf '\nLocal host [%s]: ' "$TUNNEL_LOCAL_HOST"; read -r v || v=""; [ -n "$v" ] && TUNNEL_LOCAL_HOST="$v"; TUNNEL_PROVIDER="cloudflared"; TUNNEL_HOST=""; TUNNEL_SUBDOMAIN=""; save_runtime; echo "Tunnel settings saved. Cloudflare quick tunnel is used automatically."; }
 
 show_external_target() { dashboard_header; printf '\n'; echo "mode=$EXTERNAL_MODE"; echo "path=$EXTERNAL_PATH"; echo "remote=$RCLONE_REMOTE"; }
 configure_external_target() { dashboard_header; printf '\n1.none 2.local/shared/SD folder 3.rclone remote\nSelect [1-3]: '; read -r c || c=""; case "$c" in 1) EXTERNAL_MODE="none"; EXTERNAL_PATH=""; RCLONE_REMOTE="";; 2) printf 'Folder path: '; read -r p || p=""; EXTERNAL_MODE="local"; EXTERNAL_PATH="$p"; RCLONE_REMOTE="";; 3) printf 'rclone remote:path: '; read -r p || p=""; EXTERNAL_MODE="rclone"; RCLONE_REMOTE="$p"; EXTERNAL_PATH="";; esac; save_runtime; echo "External target saved."; }
