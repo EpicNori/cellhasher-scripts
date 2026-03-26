@@ -9,6 +9,7 @@ official installer, which is not compatible with this Android/Termux setup.
 
 import os
 import re
+import shlex
 import sys
 import tempfile
 import subprocess
@@ -22,7 +23,6 @@ if sys.platform == "win32":
     except Exception:
         pass
 
-CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 ADB = os.environ.get("adb_path", "adb")
 DEVICES = [device for device in os.environ.get("devices", "").split() if device]
 
@@ -62,12 +62,6 @@ TERMUX_ENV = [
     f"HOME={TERMUX_HOME}",
     f"PREFIX={TERMUX_PREFIX}",
 ]
-TERMUX_REPO_BASE = "https://packages.termux.dev/apt/termux-main/"
-TERMUX_OFFLINE_PACKAGES = [
-    ("pool/main/c/c-ares/c-ares_1.34.6_aarch64.deb", "c-ares_1.34.6_aarch64.deb"),
-    ("pool/main/n/nodejs-lts/nodejs-lts_24.14.0_aarch64.deb", "nodejs-lts_24.14.0_aarch64.deb"),
-    ("pool/main/n/npm/npm_11.12.0_all.deb", "npm_11.12.0_all.deb"),
-]
 
 TERMUX_SETUP_SCRIPT = r'''#!/data/data/com.termux/files/usr/bin/bash
 set -euo pipefail
@@ -86,6 +80,9 @@ log() {
 }
 
 log "[INFO] Starting OpenClaw Termux setup"
+log "[INFO] Installing required Termux packages visibly on the phone"
+pkg update -y 2>&1 | tee -a "$LOG_FILE"
+pkg install -y nodejs-lts npm curl git python 2>&1 | tee -a "$LOG_FILE"
 
 for cmd in node npm curl git python; do
   if command -v "$cmd" >/dev/null 2>&1; then
@@ -150,10 +147,32 @@ exec openclaw onboard
 
 def run_subprocess(cmd, **kwargs):
     merged = {"capture_output": True, "text": True}
-    if sys.platform == "win32":
-        merged["creationflags"] = CREATE_NO_WINDOW
     merged.update(kwargs)
-    return subprocess.run(cmd, **merged)
+    print(f"[HOST] Running: {format_command(cmd)}")
+    result = subprocess.run(cmd, **merged)
+    log_completed_process(result)
+    return result
+
+
+def format_command(cmd):
+    parts = []
+    for item in cmd:
+        text = str(item)
+        if sys.platform == "win32":
+            parts.append(subprocess.list2cmdline([text]))
+        else:
+            parts.append(shlex.quote(text))
+    return " ".join(parts)
+
+
+def log_completed_process(result):
+    if result.stdout:
+        for line in result.stdout.strip().splitlines():
+            print(f"[HOST][stdout] {line}")
+    if result.stderr:
+        for line in result.stderr.strip().splitlines():
+            print(f"[HOST][stderr] {line}")
+    print(f"[HOST] Exit code: {result.returncode}")
 
 
 def adb_shell(device_id, *args, timeout=120000):
@@ -198,6 +217,7 @@ def fetch_termux_apk():
 
 
 def download_file(url, path):
+    print(f"[*] Downloading: {url}")
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     with urllib.request.urlopen(req, timeout=180) as response, open(path, "wb") as handle:
         while True:
@@ -205,17 +225,6 @@ def download_file(url, path):
             if not chunk:
                 break
             handle.write(chunk)
-
-
-def download_offline_packages(cache_dir):
-    os.makedirs(cache_dir, exist_ok=True)
-    paths = []
-    for rel_path, filename in TERMUX_OFFLINE_PACKAGES:
-        local_path = os.path.join(cache_dir, filename)
-        if not os.path.exists(local_path):
-            download_file(TERMUX_REPO_BASE + rel_path, local_path)
-        paths.append(local_path)
-    return paths
 
 
 def install_termux_apk(device_id, apk_path):
@@ -242,24 +251,6 @@ def push_file(device_id, local_path, remote_path):
         raise RuntimeError(result.stderr.strip() or result.stdout.strip() or f"adb push failed: {local_path}")
 
 
-def install_offline_runtime(device_id, local_debs):
-    remote_paths = []
-    for path in local_debs:
-        remote = f"/data/local/tmp/{os.path.basename(path)}"
-        push_file(device_id, path, remote)
-        remote_paths.append(remote)
-
-    result = termux_exec(device_id, f"{TERMUX_PREFIX}/bin/dpkg", "-i", *remote_paths, timeout=240000)
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "offline dpkg install failed")
-
-    node = termux_exec(device_id, f"{TERMUX_PREFIX}/bin/node", "-v", timeout=20000)
-    npm = termux_exec(device_id, f"{TERMUX_PREFIX}/bin/npm", "-v", timeout=20000)
-    if node.returncode != 0 or npm.returncode != 0:
-        raise RuntimeError("node/npm verification failed after offline install")
-    return node.stdout.strip(), npm.stdout.strip()
-
-
 def phone_has_network(device_id):
     result = termux_exec(
         device_id,
@@ -282,6 +273,7 @@ def write_temp_script(contents):
 
 
 def open_termux_and_run(device_id, command_text):
+    print(f"[{device_id}] Opening Termux on the phone for visible execution")
     adb_shell(device_id, "am", "force-stop", TERMUX_PACKAGE, timeout=15000)
     adb_shell(device_id, "am", "start", "-n", "com.termux/com.termux.app.TermuxActivity", timeout=30000)
     run_subprocess([ADB, "-s", device_id, "shell", "input", "keyevent", "67"], timeout=30000)
@@ -289,8 +281,9 @@ def open_termux_and_run(device_id, command_text):
     run_subprocess([ADB, "-s", device_id, "shell", "input", "keyevent", "66"], timeout=30000)
 
 
-def process_device(device_id, apk_path, local_debs, setup_script):
+def process_device(device_id, apk_path, setup_script):
     print(f"[{device_id}] Model: {get_device_model(device_id)}")
+    print(f"[{device_id}] OpenClaw itself will only be started inside the phone's Termux session")
 
     if not is_termux_installed(device_id):
         ok, output = install_termux_apk(device_id, apk_path)
@@ -300,8 +293,6 @@ def process_device(device_id, apk_path, local_debs, setup_script):
         print(f"[{device_id}] Termux already installed")
 
     ensure_termux_permissions(device_id)
-    node_version, npm_version = install_offline_runtime(device_id, local_debs)
-    print(f"[{device_id}] Offline runtime ready: node {node_version}, npm {npm_version}")
 
     if not phone_has_network(device_id):
         return f"[{device_id}] BLOCKED - Phone has no working internet/DNS for npm registry"
@@ -310,7 +301,7 @@ def process_device(device_id, apk_path, local_debs, setup_script):
     adb_shell(device_id, "chmod", "755", "/data/local/tmp/openclaw-termux-setup.sh", timeout=15000)
     adb_shell(device_id, "chmod", "755", "/data/local/tmp/openclaw-termux-setup.sh", timeout=15000)
     open_termux_and_run(device_id, "bash%s/data/local/tmp/openclaw-termux-setup.sh")
-    return f"[{device_id}] OK - Termux opened and the OpenClaw install/onboard flow was launched visibly on the device"
+    return f"[{device_id}] OK - OpenClaw was launched only inside visible Termux on the device"
 
 
 def main():
@@ -318,7 +309,7 @@ def main():
     print(" OpenClaw Android Termux Installer for Cellhasher")
     print("=" * 68)
     print("Validated pieces on a real Android 13 Samsung device:")
-    print(" - offline Node/npm bootstrap via pushed Termux .deb files")
+    print(" - visible Termux-native package install on the phone")
     print(" - native Termux npm install of openclaw")
     print(" - Termux-native wrapper generation in $PREFIX/bin")
     print()
@@ -333,13 +324,15 @@ def main():
     print("  3. Phone has working Wi-Fi or mobile data")
     print()
 
-    apk_url, apk_name = fetch_termux_apk()
-    apk_path = os.path.join(tempfile.gettempdir(), apk_name)
-    print(f"[*] Downloading Termux APK: {apk_name}")
-    download_file(apk_url, apk_path)
+    try:
+        apk_url, apk_name = fetch_termux_apk()
+        apk_path = os.path.join(tempfile.gettempdir(), apk_name)
+        print(f"[*] Downloading Termux APK: {apk_name}")
+        download_file(apk_url, apk_path)
 
-    print("[*] Downloading offline Termux runtime packages")
-    local_debs = download_offline_packages(os.path.join(os.getcwd(), "offline-cache"))
+    except Exception as exc:
+        print(f"[ERROR] Host-side dependency preparation failed: {exc}")
+        raise SystemExit(1) from exc
     setup_script = write_temp_script(TERMUX_SETUP_SCRIPT)
 
     print(f"[*] Devices selected: {len(DEVICES)}")
@@ -350,7 +343,7 @@ def main():
     results = []
     with ThreadPoolExecutor(max_workers=max(1, min(len(DEVICES), 4))) as pool:
         future_map = {
-            pool.submit(process_device, device_id, apk_path, local_debs, setup_script): device_id
+            pool.submit(process_device, device_id, apk_path, setup_script): device_id
             for device_id in DEVICES
         }
         for future in as_completed(future_map):
