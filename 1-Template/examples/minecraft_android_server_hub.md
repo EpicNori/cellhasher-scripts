@@ -291,6 +291,11 @@ get_latest_release_version() {
     fetch_minecraft_version_manifest | jq -r '.latest.release // empty'
 }
 
+is_valid_minecraft_version() {
+    local version="$1"
+    printf '%s' "$version" | grep -Eq '^1\.[0-9]+(\.[0-9]+)?$'
+}
+
 fetch_minecraft_version_manifest() {
     local manifest_url
 
@@ -331,15 +336,28 @@ get_latest_paper_version() {
 }
 
 prompt_minecraft_version() {
-    local latest_version prompt_default
+    local latest_version prompt_default prompt_label
     if [ "$SERVER_TYPE" = "paper" ]; then
         latest_version=$(get_latest_paper_version || true)
     fi
     if [ -z "$latest_version" ]; then
         latest_version=$(get_latest_release_version || true)
     fi
-    prompt_default="${latest_version:-${MC_VERSION:-1.21.4}}"
-    printf '\nMinecraft version [latest=%s, press ENTER for latest]: ' "$prompt_default"
+    if is_valid_minecraft_version "$latest_version"; then
+        prompt_default="$latest_version"
+        prompt_label="latest"
+    elif is_valid_minecraft_version "$MC_VERSION"; then
+        prompt_default="$MC_VERSION"
+        prompt_label="saved"
+    else
+        prompt_default="1.21.4"
+        prompt_label="default"
+        if [ -n "$MC_VERSION" ]; then
+            MC_VERSION=""
+            save_state
+        fi
+    fi
+    printf '\nMinecraft version [%s=%s, press ENTER for %s]: ' "$prompt_label" "$prompt_default" "$prompt_default"
     read -r requested_version || requested_version=""
     if [ -z "$requested_version" ]; then
         MC_VERSION="$prompt_default"
@@ -384,20 +402,39 @@ cat > "$START_SCRIPT" <<EOF
 set -e
 BASE_DIR="\$HOME/cellhasher-mc"
 SERVER_DIR="\$BASE_DIR/server"
+SERVER_TYPE_VALUE="${SERVER_TYPE}"
+MC_VERSION_VALUE="${MC_VERSION}"
 SERVER_JAR="${SERVER_JAR}"
 MIN_MB="${min_mb}"
 MAX_MB="${max_mb}"
 
 get_start_ip() {
     local ip_addr
-    ip_addr=$(ip addr show wlan0 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 | head -n1)
-    if [ -z "$ip_addr" ]; then
-        ip_addr=$(ip route 2>/dev/null | awk '/src/ {print $NF}' | head -n1)
+    ip_addr=\$(ip addr show wlan0 2>/dev/null | awk '/inet / {print \$2}' | cut -d/ -f1 | head -n1)
+    if [ -z "\$ip_addr" ]; then
+        ip_addr=\$(ip route 2>/dev/null | awk '/src/ {print \$NF}' | head -n1)
     fi
-    if [ -z "$ip_addr" ]; then
+    if [ -z "\$ip_addr" ]; then
         ip_addr="Unknown"
     fi
-    printf '%s' "$ip_addr"
+    printf '%s' "\$ip_addr"
+}
+
+get_java_major_version() {
+    local version_line version_token major
+    version_line=\$(java -version 2>&1 | head -n1)
+    version_token=\$(printf '%s' "\$version_line" | sed -n 's/.*version "\(.*\)".*/\1/p')
+    if [ -z "\$version_token" ]; then
+        return 1
+    fi
+    major=\$(printf '%s' "\$version_token" | cut -d. -f1)
+    if [ "\$major" = "1" ]; then
+        major=\$(printf '%s' "\$version_token" | cut -d. -f2)
+    fi
+    if ! printf '%s' "\$major" | grep -Eq '^[0-9]+$'; then
+        return 1
+    fi
+    printf '%s' "\$major"
 }
 
 if [ ! -f "\$SERVER_DIR/\$SERVER_JAR" ]; then
@@ -405,8 +442,26 @@ if [ ! -f "\$SERVER_DIR/\$SERVER_JAR" ]; then
     exit 1
 fi
 
+if ! command -v java >/dev/null 2>&1; then
+    echo "Java is not installed in Termux."
+    echo "Run the install step again to install OpenJDK."
+    exit 1
+fi
+
 cd "\$SERVER_DIR"
 SERVER_IP="\$(get_start_ip)"
+JAVA_MAJOR="\$(get_java_major_version || true)"
+if [ -n "\$JAVA_MAJOR" ] && [ "\$JAVA_MAJOR" -lt 21 ]; then
+    echo "Java 21 or newer is required to run this server."
+    echo "Current Java major version: \$JAVA_MAJOR"
+    echo "Run the install step again to upgrade OpenJDK."
+    exit 1
+fi
+if [ "\$SERVER_TYPE_VALUE" = "vanilla" ] && ! printf '%s' "\$MC_VERSION_VALUE" | grep -Eq '^1\\.[0-9]+(\\.[0-9]+)?$'; then
+    echo "Saved Minecraft version looks invalid for Vanilla: \$MC_VERSION_VALUE"
+    echo "Reinstall the server and pick a real Minecraft version such as 1.21.x."
+    exit 1
+fi
 echo "Starting ${SERVER_TYPE} ${MC_VERSION} with -Xms\${MIN_MB}M -Xmx\${MAX_MB}M"
 echo "Connect to: \${SERVER_IP}:25565"
 java -Xms\${MIN_MB}M -Xmx\${MAX_MB}M -jar "\$SERVER_JAR" nogui
@@ -434,6 +489,11 @@ apply_mobile_tuning() {
         sed -i 's/^simulation-distance=.*/simulation-distance=4/' "$SERVER_DIR/server.properties" 2>/dev/null || true
         sed -i 's/^max-players=.*/max-players=5/' "$SERVER_DIR/server.properties" 2>/dev/null || true
         sed -i 's/^motd=.*/motd=Cellhasher Android Server/' "$SERVER_DIR/server.properties" 2>/dev/null || true
+        if grep -q '^pause-when-empty-seconds=' "$SERVER_DIR/server.properties" 2>/dev/null; then
+            sed -i 's/^pause-when-empty-seconds=.*/pause-when-empty-seconds=-1/' "$SERVER_DIR/server.properties" 2>/dev/null || true
+        else
+            printf '\npause-when-empty-seconds=-1\n' >> "$SERVER_DIR/server.properties"
+        fi
     fi
 }
 
@@ -1625,7 +1685,7 @@ auto_start_remote_tunnel() {
         cecho "33" "Pinggy auto-start failed."
     fi
 
-    cecho "33" "No remote tunnel configured for auto-start."
+    cecho "33" "tunnel not configured"
     return 0
 }
 

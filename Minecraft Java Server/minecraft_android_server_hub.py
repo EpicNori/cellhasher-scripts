@@ -291,6 +291,11 @@ get_latest_release_version() {
     fetch_minecraft_version_manifest | jq -r '.latest.release // empty'
 }
 
+is_valid_minecraft_version() {
+    local version="$1"
+    printf '%s' "$version" | grep -Eq '^1\.[0-9]+(\.[0-9]+)?$'
+}
+
 fetch_minecraft_version_manifest() {
     local manifest_url
 
@@ -331,15 +336,28 @@ get_latest_paper_version() {
 }
 
 prompt_minecraft_version() {
-    local latest_version prompt_default
+    local latest_version prompt_default prompt_label
     if [ "$SERVER_TYPE" = "paper" ]; then
         latest_version=$(get_latest_paper_version || true)
     fi
     if [ -z "$latest_version" ]; then
         latest_version=$(get_latest_release_version || true)
     fi
-    prompt_default="${latest_version:-${MC_VERSION:-1.21.4}}"
-    printf '\nMinecraft version [latest=%s, press ENTER for latest]: ' "$prompt_default"
+    if is_valid_minecraft_version "$latest_version"; then
+        prompt_default="$latest_version"
+        prompt_label="latest"
+    elif is_valid_minecraft_version "$MC_VERSION"; then
+        prompt_default="$MC_VERSION"
+        prompt_label="saved"
+    else
+        prompt_default="1.21.4"
+        prompt_label="default"
+        if [ -n "$MC_VERSION" ]; then
+            MC_VERSION=""
+            save_state
+        fi
+    fi
+    printf '\nMinecraft version [%s=%s, press ENTER for %s]: ' "$prompt_label" "$prompt_default" "$prompt_default"
     read -r requested_version || requested_version=""
     if [ -z "$requested_version" ]; then
         MC_VERSION="$prompt_default"
@@ -384,20 +402,39 @@ cat > "$START_SCRIPT" <<EOF
 set -e
 BASE_DIR="\$HOME/cellhasher-mc"
 SERVER_DIR="\$BASE_DIR/server"
+SERVER_TYPE_VALUE="${SERVER_TYPE}"
+MC_VERSION_VALUE="${MC_VERSION}"
 SERVER_JAR="${SERVER_JAR}"
 MIN_MB="${min_mb}"
 MAX_MB="${max_mb}"
 
 get_start_ip() {
     local ip_addr
-    ip_addr=$(ip addr show wlan0 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 | head -n1)
-    if [ -z "$ip_addr" ]; then
-        ip_addr=$(ip route 2>/dev/null | awk '/src/ {print $NF}' | head -n1)
+    ip_addr=\$(ip addr show wlan0 2>/dev/null | awk '/inet / {print \$2}' | cut -d/ -f1 | head -n1)
+    if [ -z "\$ip_addr" ]; then
+        ip_addr=\$(ip route 2>/dev/null | awk '/src/ {print \$NF}' | head -n1)
     fi
-    if [ -z "$ip_addr" ]; then
+    if [ -z "\$ip_addr" ]; then
         ip_addr="Unknown"
     fi
-    printf '%s' "$ip_addr"
+    printf '%s' "\$ip_addr"
+}
+
+get_java_major_version() {
+    local version_line version_token major
+    version_line=\$(java -version 2>&1 | head -n1)
+    version_token=\$(printf '%s' "\$version_line" | sed -n 's/.*version "\(.*\)".*/\1/p')
+    if [ -z "\$version_token" ]; then
+        return 1
+    fi
+    major=\$(printf '%s' "\$version_token" | cut -d. -f1)
+    if [ "\$major" = "1" ]; then
+        major=\$(printf '%s' "\$version_token" | cut -d. -f2)
+    fi
+    if ! printf '%s' "\$major" | grep -Eq '^[0-9]+$'; then
+        return 1
+    fi
+    printf '%s' "\$major"
 }
 
 if [ ! -f "\$SERVER_DIR/\$SERVER_JAR" ]; then
@@ -405,8 +442,26 @@ if [ ! -f "\$SERVER_DIR/\$SERVER_JAR" ]; then
     exit 1
 fi
 
+if ! command -v java >/dev/null 2>&1; then
+    echo "Java is not installed in Termux."
+    echo "Run the install step again to install OpenJDK."
+    exit 1
+fi
+
 cd "\$SERVER_DIR"
 SERVER_IP="\$(get_start_ip)"
+JAVA_MAJOR="\$(get_java_major_version || true)"
+if [ -n "\$JAVA_MAJOR" ] && [ "\$JAVA_MAJOR" -lt 21 ]; then
+    echo "Java 21 or newer is required to run this server."
+    echo "Current Java major version: \$JAVA_MAJOR"
+    echo "Run the install step again to upgrade OpenJDK."
+    exit 1
+fi
+if [ "\$SERVER_TYPE_VALUE" = "vanilla" ] && ! printf '%s' "\$MC_VERSION_VALUE" | grep -Eq '^1\\.[0-9]+(\\.[0-9]+)?$'; then
+    echo "Saved Minecraft version looks invalid for Vanilla: \$MC_VERSION_VALUE"
+    echo "Reinstall the server and pick a real Minecraft version such as 1.21.x."
+    exit 1
+fi
 echo "Starting ${SERVER_TYPE} ${MC_VERSION} with -Xms\${MIN_MB}M -Xmx\${MAX_MB}M"
 echo "Connect to: \${SERVER_IP}:25565"
 java -Xms\${MIN_MB}M -Xmx\${MAX_MB}M -jar "\$SERVER_JAR" nogui
@@ -434,6 +489,11 @@ apply_mobile_tuning() {
         sed -i 's/^simulation-distance=.*/simulation-distance=4/' "$SERVER_DIR/server.properties" 2>/dev/null || true
         sed -i 's/^max-players=.*/max-players=5/' "$SERVER_DIR/server.properties" 2>/dev/null || true
         sed -i 's/^motd=.*/motd=Cellhasher Android Server/' "$SERVER_DIR/server.properties" 2>/dev/null || true
+        if grep -q '^pause-when-empty-seconds=' "$SERVER_DIR/server.properties" 2>/dev/null; then
+            sed -i 's/^pause-when-empty-seconds=.*/pause-when-empty-seconds=-1/' "$SERVER_DIR/server.properties" 2>/dev/null || true
+        else
+            printf '\npause-when-empty-seconds=-1\n' >> "$SERVER_DIR/server.properties"
+        fi
     fi
 }
 
@@ -1602,6 +1662,132 @@ change_ram() {
     cecho "32" "RAM updated to ${RAM_GB} GB"
 }
 
+server_config_file() {
+    printf '%s' "$SERVER_DIR/server.properties"
+}
+
+ensure_server_config_ready() {
+    load_state
+    if [ -z "$SERVER_TYPE" ] || [ ! -f "$SERVER_DIR/$SERVER_JAR" ]; then
+        cecho "31" "Install a server first."
+        return 1
+    fi
+    if [ ! -f "$(server_config_file)" ]; then
+        cecho "31" "server.properties was not found yet."
+        cecho "33" "Start the server once to let Minecraft create it."
+        return 1
+    fi
+}
+
+get_server_property() {
+    local key="$1" default_value="$2" config_file value
+    config_file="$(server_config_file)"
+    value=$(sed -n "s/^${key}=//p" "$config_file" | head -n1)
+    if [ -n "$value" ]; then
+        printf '%s' "$value"
+    else
+        printf '%s' "$default_value"
+    fi
+}
+
+set_server_property() {
+    local key="$1" value="$2" config_file
+    config_file="$(server_config_file)"
+    if grep -q "^${key}=" "$config_file" 2>/dev/null; then
+        sed -i "s|^${key}=.*|${key}=${value}|" "$config_file" 2>/dev/null || return 1
+    else
+        printf '\n%s=%s\n' "$key" "$value" >> "$config_file"
+    fi
+}
+
+prompt_server_property() {
+    local key="$1" label="$2" current_value new_value
+    current_value=$(get_server_property "$key" "")
+    printf '\n%s [%s]: ' "$label" "$current_value"
+    read -r new_value || new_value=""
+    if [ -z "$new_value" ]; then
+        return 0
+    fi
+    set_server_property "$key" "$new_value" || return 1
+    cecho "32" "${label} updated."
+}
+
+server_config_menu() {
+    local config_file
+    ensure_server_config_ready || {
+        pause
+        return 1
+    }
+    config_file="$(server_config_file)"
+
+    while true; do
+        clear
+        line
+        echo "Server config"
+        line
+        echo "File        : $config_file"
+        echo "motd        : $(get_server_property "motd" "Cellhasher Android Server")"
+        echo "max-players : $(get_server_property "max-players" "20")"
+        echo "gamemode    : $(get_server_property "gamemode" "survival")"
+        echo "difficulty  : $(get_server_property "difficulty" "easy")"
+        echo "online-mode : $(get_server_property "online-mode" "true")"
+        echo "pvp         : $(get_server_property "pvp" "true")"
+        echo "allow-flight: $(get_server_property "allow-flight" "false")"
+        echo "pause-empty : $(get_server_property "pause-when-empty-seconds" "-1")"
+        printf '\n'
+        echo "1. Edit MOTD"
+        echo "2. Edit max players"
+        echo "3. Edit gamemode"
+        echo "4. Edit difficulty"
+        echo "5. Toggle online mode"
+        echo "6. Toggle PvP"
+        echo "7. Toggle allow flight"
+        echo "8. Edit pause-when-empty-seconds"
+        echo "9. Back"
+        printf '\nSelect [1-9]: '
+        read -r choice || {
+            choice=""
+            continue
+        }
+
+        case "$choice" in
+            1) prompt_server_property "motd" "MOTD"; pause ;;
+            2) prompt_server_property "max-players" "Max players"; pause ;;
+            3) prompt_server_property "gamemode" "Gamemode"; pause ;;
+            4) prompt_server_property "difficulty" "Difficulty"; pause ;;
+            5)
+                if [ "$(get_server_property "online-mode" "true")" = "true" ]; then
+                    set_server_property "online-mode" "false"
+                else
+                    set_server_property "online-mode" "true"
+                fi
+                cecho "32" "online-mode updated."
+                pause
+                ;;
+            6)
+                if [ "$(get_server_property "pvp" "true")" = "true" ]; then
+                    set_server_property "pvp" "false"
+                else
+                    set_server_property "pvp" "true"
+                fi
+                cecho "32" "PvP updated."
+                pause
+                ;;
+            7)
+                if [ "$(get_server_property "allow-flight" "false")" = "true" ]; then
+                    set_server_property "allow-flight" "false"
+                else
+                    set_server_property "allow-flight" "true"
+                fi
+                cecho "32" "allow-flight updated."
+                pause
+                ;;
+            8) prompt_server_property "pause-when-empty-seconds" "Pause when empty seconds"; pause ;;
+            9) return 0 ;;
+        esac
+    done
+}
+
 auto_start_remote_tunnel() {
     if playit_is_running || pinggy_is_running; then
         cecho "32" "Remote tunnel already running."
@@ -1625,7 +1811,7 @@ auto_start_remote_tunnel() {
         cecho "33" "Pinggy auto-start failed."
     fi
 
-    cecho "33" "No remote tunnel configured for auto-start."
+    cecho "33" "tunnel not configured"
     return 0
 }
 
@@ -1655,11 +1841,12 @@ main_menu() {
         echo "2. Install mods/plugins"
         echo "3. Start server + auto tunnel"
         echo "4. Change RAM"
-        echo "5. Open server folder"
-        echo "6. Remote access menu"
-        echo "7. Refresh info"
-        echo "8. Exit"
-        printf '\nSelect [1-8]: '
+        echo "5. Server config"
+        echo "6. Open server folder"
+        echo "7. Remote access menu"
+        echo "8. Refresh info"
+        echo "9. Exit"
+        printf '\nSelect [1-9]: '
         read -r choice || {
             choice=""
             continue
@@ -1670,10 +1857,11 @@ main_menu() {
             2) install_addons || true; pause ;;
             3) start_server ;;
             4) change_ram || true; pause ;;
-            5) open_server_folder || true ;;
-            6) playit_menu ;;
-            7) ;;
-            8) exit 0 ;;
+            5) server_config_menu ;;
+            6) open_server_folder || true ;;
+            7) playit_menu ;;
+            8) ;;
+            9) exit 0 ;;
         esac
     done
 }
