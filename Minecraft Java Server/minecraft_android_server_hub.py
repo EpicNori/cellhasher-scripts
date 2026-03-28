@@ -76,6 +76,8 @@ SERVER_DIR="$BASE_DIR/server"
 STATE_DIR="$BASE_DIR/state"
 STATE_FILE="$STATE_DIR/server.env"
 START_SCRIPT="$BASE_DIR/start-server.sh"
+HUB_SCRIPT="$BASE_DIR/mcs-hub.sh"
+MCS_COMMAND_FILE="$PREFIX/bin/mcs"
 PLAYIT_DIR="$BASE_DIR/playit"
 PLAYIT_CONFIG_DIR="$PLAYIT_DIR"
 PLAYIT_CONFIG_FILE="$PLAYIT_DIR/playit.toml"
@@ -93,6 +95,23 @@ PINGGY_API_PORT="4300"
 USER_AGENT="Cellhasher-Minecraft-Hub/1.0 (https://github.com/)"
 
 mkdir -p "$BASE_DIR" "$SERVER_DIR" "$STATE_DIR"
+
+install_mcs_command() {
+    mkdir -p "$BASE_DIR" "$STATE_DIR"
+
+    if [ "$0" != "$HUB_SCRIPT" ]; then
+        cp "$0" "$HUB_SCRIPT" 2>/dev/null || cat "$0" > "$HUB_SCRIPT"
+        chmod 755 "$HUB_SCRIPT" 2>/dev/null || true
+    fi
+
+    cat > "$MCS_COMMAND_FILE" <<EOF
+#!/data/data/com.termux/files/usr/bin/bash
+exec "$HUB_SCRIPT" "\$@"
+EOF
+    chmod 755 "$MCS_COMMAND_FILE" 2>/dev/null || true
+}
+
+install_mcs_command
 
 cecho() {
     local color="$1"
@@ -1604,7 +1623,7 @@ open_server_folder() {
         return 1
     fi
 
-    local shared_root export_dir doc_uri
+    local shared_root export_root export_dir doc_uri
 
     clear
     line
@@ -1626,7 +1645,8 @@ open_server_folder() {
         return 1
     fi
 
-    export_dir="$shared_root/CellhasherMCServer"
+    export_root="$shared_root/CellhasherMCServer"
+    export_dir="$export_root/server"
     rm -rf "$export_dir"
     mkdir -p "$export_dir"
 
@@ -1638,7 +1658,7 @@ open_server_folder() {
 
     echo "Exported server files to: $export_dir"
 
-    doc_uri="content://com.android.externalstorage.documents/document/primary%3ACellhasherMCServer"
+    doc_uri="content://com.android.externalstorage.documents/document/primary%3ACellhasherMCServer%2Fserver"
 
     termux-open "$export_dir" >/dev/null 2>&1 \
         || am start -a android.intent.action.VIEW -d "$doc_uri" >/dev/null 2>&1 \
@@ -1647,7 +1667,7 @@ open_server_folder() {
 
     echo ""
     echo "If Android did not open the folder automatically,"
-    echo "open Files and browse to: Internal storage/CellhasherMCServer"
+    echo "open Files and browse to: Internal storage/CellhasherMCServer/server"
 }
 
 change_ram() {
