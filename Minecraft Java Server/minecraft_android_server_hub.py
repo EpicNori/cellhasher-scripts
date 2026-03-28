@@ -1677,6 +1677,7 @@ ensure_server_config_ready() {
         cecho "33" "Start the server once to let Minecraft create it."
         return 1
     fi
+    set_server_property "pause-when-empty-seconds" "-1" || true
 }
 
 get_server_property() {
@@ -1743,8 +1744,9 @@ server_config_menu() {
         echo "6. Toggle PvP"
         echo "7. Toggle allow flight"
         echo "8. Edit pause-when-empty-seconds"
-        echo "9. Back"
-        printf '\nSelect [1-9]: '
+        echo "9. Install mods/plugins"
+        echo "10. Back"
+        printf '\nSelect [1-10]: '
         read -r choice || {
             choice=""
             continue
@@ -1783,7 +1785,8 @@ server_config_menu() {
                 pause
                 ;;
             8) prompt_server_property "pause-when-empty-seconds" "Pause when empty seconds"; pause ;;
-            9) return 0 ;;
+            9) install_addons || true; pause ;;
+            10) return 0 ;;
         esac
     done
 }
@@ -1838,15 +1841,14 @@ main_menu() {
         printf '\n'
         line
         echo "1. Install or reinstall server"
-        echo "2. Install mods/plugins"
-        echo "3. Start server + auto tunnel"
-        echo "4. Change RAM"
-        echo "5. Server config"
-        echo "6. Open server folder"
-        echo "7. Remote access menu"
-        echo "8. Refresh info"
-        echo "9. Exit"
-        printf '\nSelect [1-9]: '
+        echo "2. Start server + auto tunnel"
+        echo "3. Change RAM"
+        echo "4. Server config"
+        echo "5. Open server folder"
+        echo "6. Remote access menu"
+        echo "7. Refresh info"
+        echo "8. Exit"
+        printf '\nSelect [1-8]: '
         read -r choice || {
             choice=""
             continue
@@ -1854,14 +1856,13 @@ main_menu() {
 
         case "$choice" in
             1) install_server || true; pause ;;
-            2) install_addons || true; pause ;;
-            3) start_server ;;
-            4) change_ram || true; pause ;;
-            5) server_config_menu ;;
-            6) open_server_folder || true ;;
-            7) playit_menu ;;
-            8) ;;
-            9) exit 0 ;;
+            2) start_server ;;
+            3) change_ram || true; pause ;;
+            4) server_config_menu ;;
+            5) open_server_folder || true ;;
+            6) playit_menu ;;
+            7) ;;
+            8) exit 0 ;;
         esac
     done
 }
