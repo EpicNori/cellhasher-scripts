@@ -144,10 +144,18 @@ export PATH="$PREFIX/bin:/system/bin"
 exec "$PREFIX/bin/proot-distro" login ubuntu --shared-tmp -- env -i HOME=/root USER=root LOGNAME=root PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin /bin/bash -lc '
   export NODE_OPTIONS="-r /root/hijack.js ${NODE_OPTIONS:-}"
   cd /root
-  exec openclaw "$@"
+  openclaw "$@"
+  printf "\nOpenClaw exited. You are still in Ubuntu.\n\n"
+  exec /bin/bash -il
 ' bash "$@"
 EOF
 chmod 755 "$HOME/server/bin/openclaw_ubuntu.sh"
+
+cat > "$PREFIX/bin/claw" <<'EOF'
+#!/data/data/com.termux/files/usr/bin/bash
+exec /data/user/0/com.termux/files/home/server/bin/openclaw_ubuntu.sh "$@"
+EOF
+chmod 755 "$PREFIX/bin/claw"
 
 cat > "$HOME/server/bin/enter_ubuntu.sh" <<'EOF'
 #!/data/data/com.termux/files/usr/bin/bash
@@ -166,7 +174,9 @@ export PATH="$PREFIX/bin:/system/bin"
 exec "$PREFIX/bin/proot-distro" login ubuntu --shared-tmp -- env -i HOME=/root USER=root LOGNAME=root PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin /bin/bash -lc '
   export NODE_OPTIONS="-r /root/hijack.js ${NODE_OPTIONS:-}"
   cd /root
-  exec openclaw gateway --verbose
+  openclaw gateway --verbose
+  printf "\nGateway exited. You are still in Ubuntu.\n\n"
+  exec /bin/bash -il
 '
 EOF
 chmod 755 "$HOME/server/bin/start_openclaw.sh"
@@ -220,19 +230,21 @@ if ! "${UBUNTU_LOGIN[@]}" 'test -f /root/hijack.js'; then
 fi
 if ! ubuntu_has_openclaw; then
   fail "OpenClaw was not installed inside Ubuntu" 23
-fi
+  fi
 
 python "$HOME/server/scripts/test.py" 2>&1 | tee -a "$LOG_FILE"
 log "[OK] OpenClaw files installed"
 log "[OK] Ubuntu helper written to $HOME/server/bin/openclaw_ubuntu.sh"
+log "[OK] Claw launcher written to $PREFIX/bin/claw"
 log "[OK] Ubuntu shell helper written to $HOME/server/bin/enter_ubuntu.sh"
+log "[INFO] You can now run: claw"
 log "[INFO] Launching OpenClaw onboarding inside Ubuntu"
 echo "success" > "$STATUS_FILE"
 exec "$PREFIX/bin/proot-distro" login ubuntu --shared-tmp -- env -i HOME=/root USER=root LOGNAME=root PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin /bin/bash -lc '
   export NODE_OPTIONS="-r /root/hijack.js ${NODE_OPTIONS:-}"
   cd /root
   openclaw onboard
-  printf "\nOpenClaw onboarding finished. You are now in Ubuntu.\nUse: openclaw gateway --verbose\n\n"
+  printf "\nOpenClaw onboarding finished. You are now in Ubuntu.\nUse: claw\nOr inside Ubuntu use: openclaw gateway --verbose\n\n"
   exec /bin/bash -il
 '
 '''
@@ -482,7 +494,8 @@ def main():
     print()
     print("If install succeeds, complete the visible `openclaw onboard` flow in Ubuntu.")
     print("The terminal will remain inside Ubuntu afterward for manual OpenClaw use.")
-    print("Use `openclaw gateway --verbose` there, or later run `~/server/bin/enter_ubuntu.sh`.")
+    print("You can then use `claw` to enter Ubuntu and run OpenClaw.")
+    print("Or later run `~/server/bin/enter_ubuntu.sh` to enter Ubuntu directly.")
 
 
 if __name__ == "__main__":
