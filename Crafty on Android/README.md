@@ -4,6 +4,16 @@ A Python installer for Cellhasher/ADB and direct Termux use, plus an equivalent
 standalone Bash installer. Installs Crafty Controller's HTTPS web panel and Java
 inside an isolated Ubuntu 24.04 PRoot distribution, without rooting Android.
 
+## Documentation
+
+| Guide | Covers |
+| --- | --- |
+| [Installation and options](docs/INSTALLATION.md) | Termux, Bash, Cellhasher/ADB, flags, defaults, first login |
+| [Operations and performance](docs/OPERATIONS.md) | Minecraft setup, commands, boot startup, maximum performance, backups |
+| [Troubleshooting](docs/TROUBLESHOOTING.md) | Download failures, panel access, startup errors, RAM, logs, recovery |
+| [Developer guide](docs/DEVELOPMENT.md) | Architecture, generated payloads, data boundaries, tests, maintenance |
+| [Validation record](VALIDATION.md) | Real-device checks and remaining gameplay/reboot acceptance steps |
+
 ## Install directly on the phone
 
 Install **Termux from F-Droid or the official Termux GitHub releases**, open it,
@@ -164,7 +174,9 @@ watch for Android memory pressure as the heap grows.
 The profile backs up the database before changing standard `java ... -jar ...`
 commands. Custom shell/wrapper/argfile commands are rejected; tune those in Crafty
 using `manual`. It also refuses to start if the calculated heap is below 512 MB
-per server; close other apps, reduce the number of servers, or switch to manual.
+per server; reduce the number of configured Java servers or switch to manual.
+Closing other apps helps runtime memory pressure but does not change this
+total-RAM-based ceiling.
 Newly created servers are tuned on the next Crafty restart. Switching to `manual`
 keeps the last commands; adjust RAM/CPU in Crafty to change them further.
 
@@ -172,6 +184,8 @@ CPU clocks, Android process CPU sets, and thermal throttling remain under Androi
 control. The installer does not overclock, disable thermal protection, or require
 root. For sustained speed, allow background activity, turn off Android Battery
 Saver yourself, keep the phone cool, and reduce Minecraft simulation/view distance.
+
+## Storage and backups
 
 - Host state/logs: `~/cellhasher-crafty/`; install status is `install.status`.
 - Rotating supervisor logs: `~/cellhasher-crafty/logs/service/current` (five
